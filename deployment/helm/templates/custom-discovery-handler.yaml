@@ -3,14 +3,18 @@ apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: {{ printf "%s-daemonset" .Values.custom.discovery.name }}
+  labels: {{- include "akri.labels" . | nindent 4 }}
+    app.kubernetes.io/name: {{ .Values.custom.discovery.name }}
+    app.kubernetes.io/component: discovery-handler
 spec:
   selector:
-    matchLabels:
-      name: {{ .Values.custom.discovery.name }}
+    matchLabels: {{- include "akri.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/name: {{ .Values.custom.discovery.name }}
   template:
     metadata:
-      labels:
-        name: {{ .Values.custom.discovery.name }}
+      labels: {{- include "akri.labels" . | nindent 8 }}
+        app.kubernetes.io/name: {{ .Values.custom.discovery.name }}
+        app.kubernetes.io/component: discovery-handler
     spec:
       containers:
       - name: {{ .Values.custom.discovery.name }}
@@ -25,7 +29,18 @@ spec:
           limits:
             memory: {{ .Values.custom.discovery.resources.memoryLimit }}
             cpu: {{ .Values.custom.discovery.resources.cpuLimit }}
+        {{- if .Values.custom.discovery.useNetworkConnection }}
+        ports:
+        - name: discovery
+          containerPort: {{ .Values.custom.discovery.port }}
+        {{- end }}
         env:
+        {{- if .Values.custom.discovery.useNetworkConnection }}
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        {{- end }}
         - name: DISCOVERY_HANDLERS_DIRECTORY
           value: /var/lib/akri
         volumeMounts:
@@ -35,10 +50,11 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- if .Values.custom.discovery.nodeSelectors }}
       nodeSelector:
-      {{- toYaml .Values.custom.discovery.nodeSelectors | nindent 8 }}
-      {{- end }}
+        "kubernetes.io/os": linux
+        {{- if .Values.custom.discovery.nodeSelectors }}
+          {{- toYaml .Values.custom.discovery.nodeSelectors | nindent 8 }}
+        {{- end }}
       volumes:
       - name: discovery-handlers
         hostPath:

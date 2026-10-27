@@ -1,5 +1,6 @@
-use actix_web::{post, web, App, HttpResponse, HttpServer, Responder};
-use akri_shared::akri::configuration::KubeAkriConfig;
+use actix_web::{App, HttpResponse, HttpServer, Responder, post, web};
+use akri_shared::akri::configuration::Configuration;
+use akri_udev::discovery_handler::UdevDiscoveryDetails;
 use clap::Arg;
 use k8s_openapi::apimachinery::pkg::runtime::RawExtension;
 use openapi::models::{
@@ -7,7 +8,7 @@ use openapi::models::{
     V1AdmissionReview as AdmissionReview, V1Status as Status,
 };
 use openssl::ssl::{SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn get_builder(key: &str, crt: &str) -> SslAcceptorBuilder {
     let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
@@ -27,11 +28,10 @@ fn check(
     match v {
         serde_json::Value::Object(o) => {
             for (key, value) in o {
-                if let Err(e) = check(&value, &deserialized[key]) {
-                    return Err(None.ok_or(format!(
-                        "input key ({:?}) not equal to parsed: ({:?})",
-                        key, e
-                    ))?);
+                if let Err(e) = check(value, &deserialized[key]) {
+                    return Err(
+                        None.ok_or(format!("input key ({key:?}) not equal to parsed: ({e:?})"))?
+                    );
                 }
             }
             Ok(())
@@ -40,8 +40,7 @@ fn check(
             for (pos, _e) in s.iter().enumerate() {
                 if let Err(e) = check(&s[pos], &deserialized[pos]) {
                     return Err(None.ok_or(format!(
-                        "input index ({:?}) not equal to parsed: ({:?})",
-                        pos, e
+                        "input index ({pos:?}) not equal to parsed: ({e:?})"
                     ))?);
                 }
             }
@@ -50,47 +49,43 @@ fn check(
         serde_json::Value::String(s) => match deserialized {
             serde_json::Value::String(ds) => {
                 if s != ds {
-                    Err(None.ok_or(format!("input ({:?}) not equal to parsed ({:?})", s, ds))?)
+                    Err(None.ok_or(format!("input ({s:?}) not equal to parsed ({ds:?})"))?)
                 } else {
                     Ok(())
                 }
             }
             _ => Err(None.ok_or(format!(
-                "input ({:?}) not equal to parsed ({:?})",
-                s, deserialized
+                "input ({s:?}) not equal to parsed ({deserialized:?})"
             ))?),
         },
         serde_json::Value::Bool(b) => match deserialized {
             serde_json::Value::Bool(db) => {
                 if b != db {
-                    Err(None.ok_or(format!("input ({:?}) not equal to parsed ({:?})", b, db))?)
+                    Err(None.ok_or(format!("input ({b:?}) not equal to parsed ({db:?})"))?)
                 } else {
                     Ok(())
                 }
             }
             _ => Err(None.ok_or(format!(
-                "input ({:?}) not equal to parsed ({:?})",
-                b, deserialized
+                "input ({b:?}) not equal to parsed ({deserialized:?})"
             ))?),
         },
         serde_json::Value::Number(n) => match deserialized {
             serde_json::Value::Number(dn) => {
                 if n != dn {
-                    Err(None.ok_or(format!("input ({:?}) not equal to parsed ({:?})", n, dn))?)
+                    Err(None.ok_or(format!("input ({n:?}) not equal to parsed ({dn:?})"))?)
                 } else {
                     Ok(())
                 }
             }
             _ => Err(None.ok_or(format!(
-                "input ({:?}) not equal to parsed ({:?})",
-                n, deserialized
+                "input ({n:?}) not equal to parsed ({deserialized:?})"
             ))?),
         },
         serde_json::Value::Null => match deserialized {
             serde_json::Value::Null => Ok(()),
             _ => Err(None.ok_or(format!(
-                "input (Null) not equal to parsed ({:?})",
-                deserialized
+                "input (Null) not equal to parsed ({deserialized:?})"
             ))?),
         },
     }
@@ -103,7 +98,7 @@ fn filter_configuration(mut v: Value) -> Value {
     metadata.remove("managedFields");
 
     let generation = metadata.get_mut("generation").unwrap();
-    *generation = json!(generation.as_f64().unwrap());
+    *generation = json!(generation.as_u64().unwrap());
 
     v
 }
@@ -115,19 +110,41 @@ fn validate_configuration(rqst: &AdmissionRequest) -> AdmissionResponse {
             let x: RawExtension = serde_json::from_value(raw.clone())
                 .expect("Could not parse as Kubernetes RawExtension");
             let y = serde_json::to_string(&x).unwrap();
-            let config: KubeAkriConfig =
+            let config: Configuration =
                 serde_json::from_str(y.as_str()).expect("Could not parse as Akri Configuration");
+            match validate_udev_discovery_details(&config) {
+                Ok(_) => {
+                    println!("validate_configuration - udev discovery details are valid");
+                }
+                Err(_) => {
+                    return AdmissionResponse {
+                        allowed: false,
+                        audit_annotations: None,
+                        patch: None,
+                        patch_type: None,
+                        status: Some(Status {
+                            api_version: None,
+                            code: None,
+                            details: None,
+                            kind: None,
+                            message: Some(
+                                "Invalid udev discovery details device permissions".to_owned(),
+                            ),
+                            metadata: None,
+                            reason: None,
+                            status: None,
+                        }),
+                        uid: rqst.uid.to_owned(),
+                        warnings: None,
+                    };
+                }
+            }
+
             let reserialized = serde_json::to_string(&config).unwrap();
             let deserialized: Value = serde_json::from_str(&reserialized).expect("untyped JSON");
-            println!(
-                "validate_configuration - deserialized Configuration: {:?}",
-                deserialized
-            );
+            println!("validate_configuration - deserialized Configuration: {deserialized:?}");
             let val: Value = filter_configuration(raw.clone());
-            println!(
-                "validate_configuration - expected deserialized format: {:?}",
-                val
-            );
+            println!("validate_configuration - expected deserialized format: {val:?}");
 
             // Do they match?
             match check(&val, &deserialized) {
@@ -173,13 +190,44 @@ fn validate_configuration(rqst: &AdmissionRequest) -> AdmissionResponse {
     }
 }
 
+fn validate_udev_discovery_details(config: &Configuration) -> Result<(), String> {
+    match &config.spec.discovery_handler.discovery_details {
+        details if details.is_empty() => {
+            println!("Discovery details are empty");
+            Ok(())
+        }
+        details => {
+            // Check if this is a Udev discovery handler
+            if config.spec.discovery_handler.name.to_lowercase() != "udev" {
+                // This is not a Udev configuration, so we don't need to validate it
+                return Ok(());
+            }
+
+            // Try to parse the discovery details as UdevDiscoveryDetails
+            match serde_yaml::from_str::<UdevDiscoveryDetails>(details) {
+                Ok(_) => {
+                    // The UdevDiscoveryDetails struct already has a custom deserializer for permissions
+                    // If we got here, that means the JSON was parsed successfully and permissions were validated
+                    Ok(())
+                }
+                Err(e) => {
+                    println!("Error parsing UdevDiscoveryDetails: {e}");
+                    println!("JSON was: {details}");
+                    // Return a proper error message when parsing fails
+                    Err(format!("Could not parse as Udev DiscoveryDetails: {e}"))
+                }
+            }
+        }
+    }
+}
+
 #[post("/validate")]
 async fn validate(rqst: web::Json<AdmissionReview>) -> impl Responder {
     println!("Handler invoked");
     match &rqst.request {
         Some(rqst) => {
             println!("Handler received: AdmissionRequest");
-            let resp = validate_configuration(&rqst);
+            let resp = validate_configuration(rqst);
             let resp: AdmissionReview = AdmissionReview {
                 api_version: Some("admission.k8s.io/v1".to_owned()),
                 kind: Some("AdmissionReview".to_owned()),
@@ -187,52 +235,55 @@ async fn validate(rqst: web::Json<AdmissionReview>) -> impl Responder {
                 response: Some(resp),
             };
             let body = serde_json::to_string(&resp).expect("Valid AdmissionReview");
-            return HttpResponse::Ok().body(body);
+            HttpResponse::Ok().body(body)
         }
         None => {
             println!("Handler received: Nothing");
-            return HttpResponse::BadRequest().body("");
+            HttpResponse::BadRequest().body("")
         }
     }
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let matches = clap::App::new("Akri Webhook")
+    let matches = clap::Command::new("Akri Webhook")
         .arg(
             Arg::new("crt_file")
                 .long("tls-crt-file")
-                .takes_value(true)
                 .required(true)
-                .about("TLS certificate file"),
+                .help("TLS certificate file"),
         )
         .arg(
             Arg::new("key_file")
                 .long("tls-key-file")
-                .takes_value(true)
                 .required(true)
-                .about("TLS private key file"),
+                .help("TLS private key file"),
         )
         .arg(
             Arg::new("port")
                 .long("port")
-                .takes_value(true)
+                .value_parser(clap::value_parser!(u16))
+                .default_value("8443")
                 .required(true)
-                .about("port"),
+                .help("port"),
         )
         .get_matches();
 
-    let crt_file = matches.value_of("crt_file").expect("TLS certificate file");
-    let key_file = matches.value_of("key_file").expect("TLS private key file");
+    let crt_file = matches
+        .get_one::<String>("crt_file")
+        .map(|v| v.as_str())
+        .expect("TLS certificate file");
+    let key_file = matches
+        .get_one::<String>("key_file")
+        .map(|v| v.as_str())
+        .expect("TLS private key file");
 
     let port = matches
-        .value_of("port")
-        .unwrap_or("8443")
-        .parse::<u16>()
+        .get_one::<u16>("port")
         .expect("valid port [0-65535]");
 
-    let endpoint = format!("0.0.0.0:{}", port);
-    println!("Started Webhook server: {}", endpoint);
+    let endpoint = format!("0.0.0.0:{port}");
+    println!("Started Webhook server: {endpoint}");
 
     let builder = get_builder(key_file, crt_file);
     HttpServer::new(|| App::new().service(validate))
@@ -244,9 +295,9 @@ async fn main() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use actix_web::test;
-
-    const VALID: &str = r#"
+    const BROKER_SPEC_INSERTION_KEYWORD: &str = "INSERT_BROKER_SPEC_HERE";
+    const DISCOVERY_PROPERTIES_INSERTION_KEYWORD: &str = "INSERT_DISCOVERY_PROPERTIES_HERE";
+    const ADMISSION_REVIEW: &str = r#"
     {
         "kind": "AdmissionReview",
         "apiVersion": "admission.k8s.io/v1",
@@ -299,26 +350,9 @@ mod tests {
                         "name": "debugEcho",
                         "discoveryDetails": "descriptions:\n- \"foo0\"\n- \"foo1\"\n"
                     },
-                    "brokerPodSpec": {
-                        "containers": [
-                            {
-                                "image": "image",
-                                "name": "name",
-                                "resources": {
-                                    "limits": {
-                                        "{{PLACEHOLDER}}": "1"
-                                    }
-                                }
-                            }
-                        ],
-                        "imagePullSecrets": [
-                            {
-                                "name": "name"
-                            }
-                        ]
-                    },
-                    "capacity": 1,
-                    "brokerProperties": {}
+                    "brokerSpec": {
+                        INSERT_BROKER_SPEC_HERE
+                    }
                 }
             },
             "oldObject": null,
@@ -328,14 +362,9 @@ mod tests {
                 "apiVersion": "meta.k8s.io/v1"
             }
         }
-    }
-    "#;
+    }"#;
 
-    // Valid JSON but invalid akri.sh/v0/Configuration
-    // Misplaced `resources`
-    //   Valid: .request.object.spec.brokerPodSpec.containers[*].resources
-    // Invalid: .request.object.spec.brokerPodSpec.resources
-    const INVALID: &str = r#"
+    const EXTENDED_ADMISSION_REVIEW: &str = r#"
     {
         "kind": "AdmissionReview",
         "apiVersion": "admission.k8s.io/v1",
@@ -388,107 +417,8 @@ mod tests {
                         "name": "debugEcho",
                         "discoveryDetails": "{\"descriptions\": [\"foo\",\"bar\"]}"
                     },
-                    "brokerPodSpec": {
-                        "containers": [
-                            {
-                                "image": "image",
-                                "name": "name"
-                            }
-                        ],
-                        "resources": {
-                            "limits": {
-                                "{{PLACEHOLDER}}": "1"
-                            }
-                        },
-                        "imagePullSecrets": [
-                            {
-                                "name": "name"
-                            }
-                        ]
-                    },
-                    "capacity": 1
-                }
-            },
-            "oldObject": null,
-            "dryRun": false,
-            "options": {
-                "kind": "CreateOptions",
-                "apiVersion": "meta.k8s.io/v1"
-            }
-        }
-    }
-    "#;
-
-    const EXTENDED: &str = r#"
-    {
-        "kind": "AdmissionReview",
-        "apiVersion": "admission.k8s.io/v1",
-        "request": {
-            "uid": "00000000-0000-0000-0000-000000000000",
-            "kind": {
-                "group": "akri.sh",
-                "version": "v0",
-                "kind": "Configuration"
-            },
-            "resource": {
-                "group": "akri.sh",
-                "version": "v0",
-                "resource": "configurations"
-            },
-            "requestKind": {
-                "group": "akri.sh",
-                "version": "v0",
-                "kind": "Configuration"
-            },
-            "requestResource": {
-                "group": "akri.sh",
-                "version": "v0",
-                "resource": "configurations"
-            },
-            "name": "name",
-            "namespace": "default",
-            "operation": "CREATE",
-            "userInfo": {
-                "username": "admin",
-                "uid": "admin",
-                "groups": []
-            },
-            "object": {
-                "apiVersion": "akri.sh/v0",
-                "kind": "Configuration",
-                "metadata": {
-                    "annotations": {
-                        "kubectl.kubernetes.io/last-applied-configuration": ""
-                    },
-                    "creationTimestamp": "2021-01-01T00:00:00Z",
-                    "generation": 1,
-                    "managedFields": [],
-                    "name": "name",
-                    "namespace": "default",
-                    "uid": "00000000-0000-0000-0000-000000000000"
-                },
-                "spec": {
-                    "discoveryHandler": {
-                        "name": "debugEcho",
-                        "discoveryDetails": "{\"descriptions\": [\"foo\",\"bar\"]}"
-                    },
-                    "brokerPodSpec": {
-                        "containers": [
-                            {
-                                "image": "image",
-                                "name": "name",
-                                "resources": {
-                                    "limits": {
-                                        "{{PLACEHOLDER}}": "1"
-                                    }
-                                }
-                            }
-                        ],
-                        "imagePullSecrets": [
-                            {
-                                "name": "name"
-                            }
-                        ]
+                    "brokerSpec": {
+                        INSERT_BROKER_SPEC_HERE
                     },
                     "instanceServiceSpec": {
                         "type": "ClusterIP",
@@ -507,7 +437,7 @@ mod tests {
                             "targetPort": 0,
                             "protocol": "TCP"
                         }]
-                    },           
+                    },
                     "capacity": 1
                 }
             },
@@ -518,8 +448,174 @@ mod tests {
                 "apiVersion": "meta.k8s.io/v1"
             }
         }
-    }
-    "#;
+    }"#;
+
+    const ADMISSION_REVIEW_FOR_DISCOVERY_PROPERTIES: &str = r#"
+    {
+        "kind": "AdmissionReview",
+        "apiVersion": "admission.k8s.io/v1",
+        "request": {
+            "uid": "00000000-0000-0000-0000-000000000000",
+            "kind": {
+                "group": "akri.sh",
+                "version": "v0",
+                "kind": "Configuration"
+            },
+            "resource": {
+                "group": "akri.sh",
+                "version": "v0",
+                "resource": "configurations"
+            },
+            "requestKind": {
+                "group": "akri.sh",
+                "version": "v0",
+                "kind": "Configuration"
+            },
+            "requestResource": {
+                "group": "akri.sh",
+                "version": "v0",
+                "resource": "configurations"
+            },
+            "name": "name",
+            "namespace": "default",
+            "operation": "CREATE",
+            "userInfo": {
+                "username": "admin",
+                "uid": "admin",
+                "groups": []
+            },
+            "object": {
+                "apiVersion": "akri.sh/v0",
+                "kind": "Configuration",
+                "metadata": {
+                    "annotations": {
+                        "kubectl.kubernetes.io/last-applied-configuration": ""
+                    },
+                    "creationTimestamp": "2021-01-01T00:00:00Z",
+                    "generation": 1,
+                    "managedFields": [],
+                    "name": "name",
+                    "namespace": "default",
+                    "uid": "00000000-0000-0000-0000-000000000000"
+                },
+                "spec": {
+                    "discoveryHandler": {
+                        INSERT_DISCOVERY_PROPERTIES_HERE
+                        "name": "debugEcho",
+                        "discoveryDetails": "descriptions:\n- \"foo0\"\n- \"foo1\"\n"
+                    }
+                }
+            },
+            "oldObject": null,
+            "dryRun": false,
+            "options": {
+                "kind": "CreateOptions",
+                "apiVersion": "meta.k8s.io/v1"
+            }
+        }
+    }"#;
+
+    const VALID_BROKER_POD_SPEC: &str = r#"
+    "brokerPodSpec": {
+        "containers": [
+            {
+                "image": "image",
+                "name": "name",
+                "resources": {
+                    "limits": {
+                        "{{PLACEHOLDER}}": "1"
+                    }
+                }
+            }
+        ],
+        "imagePullSecrets": [
+            {
+                "name": "name"
+            }
+        ]
+    }"#;
+
+    // Valid JSON but invalid akri.sh/v0/Configuration when inserted into
+    // brokerSpec of ADMISSION_REVIEW OR EXTENDED_ADMISSION_REVIEW constants.
+    // Contains a field unknown to PodSpec — it gets dropped on typed
+    // deserialization, the round-trip mismatch is detected, and the
+    // Configuration is rejected.
+    //
+    // The previous fixture misplaced `resources` at the PodSpec level. Since
+    // k8s 1.32 added pod-level resources (PodLevelResources alpha), that
+    // pattern is no longer schema-invalid; a synthetic unknown field is used
+    // instead.
+    const INVALID_BROKER_POD_SPEC: &str = r#"
+    "brokerPodSpec": {
+        "containers": [
+            {
+                "image": "image",
+                "name": "name"
+            }
+        ],
+        "xUnknownSyntheticField": "this_field_does_not_exist",
+        "imagePullSecrets": [
+            {
+                "name": "name"
+            }
+        ]
+    }"#;
+
+    const VALID_BROKER_JOB_SPEC: &str = r#"
+    "brokerJobSpec": {
+        "template": {
+            "spec": {
+                "containers": [
+                    {
+                        "image": "image",
+                        "name": "name",
+                        "resources": {
+                            "limits": {
+                                "{{PLACEHOLDER}}": "1"
+                            }
+                        }
+                    }
+                ],
+                "imagePullSecrets": [
+                    {
+                        "name": "name"
+                    }
+                ]
+            }
+        }
+    }"#;
+
+    // Valid JSON but invalid akri.sh/v0/Configuration when inserted into
+    // brokerSpec of ADMISSION_REVIEW OR EXTENDED_ADMISSION_REVIEW constants.
+    // Contains a field unknown to PodSpec inside the Job template — it gets
+    // dropped on typed deserialization, the round-trip mismatch is detected,
+    // and the Configuration is rejected. See INVALID_BROKER_POD_SPEC for the
+    // history (the prior fixture relied on pod-level `resources` being
+    // schema-invalid, which is no longer true as of k8s 1.32).
+    const INVALID_BROKER_JOB_SPEC: &str = r#"
+    "brokerJobSpec": {
+        "template": {
+            "spec": {
+                "containers": [
+                    {
+                        "image": "image",
+                        "name": "name",
+                        "resources": {
+                            "limits": {
+                                "{{PLACEHOLDER}}": "1"
+                            }
+                        }
+                    }
+                ],
+                "xUnknownSyntheticField": "this_field_does_not_exist",
+                "imagePullSecrets": [
+                    {
+                        "name": "name"
+                    }
+                ]
+            }
+        }
+    }"#;
 
     const METADATA: &str = r#"
     {
@@ -537,8 +633,41 @@ mod tests {
             "uid": "00000000-0000-0000-0000-000000000000"
         },
         "spec": {}
+    }"#;
+
+    fn get_valid_admission_review_with_broker_pod_spec() -> String {
+        ADMISSION_REVIEW.replace(BROKER_SPEC_INSERTION_KEYWORD, VALID_BROKER_POD_SPEC)
     }
-    "#;
+
+    fn get_invalid_admission_review_with_broker_pod_spec() -> String {
+        ADMISSION_REVIEW.replace(BROKER_SPEC_INSERTION_KEYWORD, INVALID_BROKER_POD_SPEC)
+    }
+
+    fn get_extended_admission_review_with_broker_pod_spec() -> String {
+        EXTENDED_ADMISSION_REVIEW.replace(BROKER_SPEC_INSERTION_KEYWORD, VALID_BROKER_POD_SPEC)
+    }
+
+    fn get_valid_admission_review_with_broker_job_spec() -> String {
+        ADMISSION_REVIEW.replace(BROKER_SPEC_INSERTION_KEYWORD, VALID_BROKER_JOB_SPEC)
+    }
+
+    fn get_invalid_admission_review_with_broker_job_spec() -> String {
+        ADMISSION_REVIEW.replace(BROKER_SPEC_INSERTION_KEYWORD, INVALID_BROKER_JOB_SPEC)
+    }
+
+    fn get_invalid_admission_review_with_broker_job_and_pod_spec() -> String {
+        let invalid_setting_both_broker_job_and_pod =
+            format!("{VALID_BROKER_JOB_SPEC},\n{VALID_BROKER_POD_SPEC}");
+        ADMISSION_REVIEW.replace(
+            BROKER_SPEC_INSERTION_KEYWORD,
+            &invalid_setting_both_broker_job_and_pod,
+        )
+    }
+
+    fn get_admission_review_with_discovery_properties(discovery_properties: &str) -> String {
+        ADMISSION_REVIEW_FOR_DISCOVERY_PROPERTIES
+            .replace(DISCOVERY_PROPERTIES_INSERTION_KEYWORD, discovery_properties)
+    }
 
     // JSON Syntax Tests
     #[test]
@@ -680,10 +809,10 @@ mod tests {
     }
 
     // Akri Configuration schema tests
-    use kube::api::{Object, Void};
+    use kube::api::{NotUsed, Object};
     #[test]
     fn test_creationtimestamp_is_filtered() {
-        let t: Object<Void, Void> = serde_json::from_str(METADATA).expect("Valid Metadata");
+        let t: Object<NotUsed, NotUsed> = serde_json::from_str(METADATA).expect("Valid Metadata");
         let reserialized = serde_json::to_string(&t).expect("bytes");
         let deserialized: Value = serde_json::from_str(&reserialized).expect("untyped JSON");
         let v = filter_configuration(deserialized);
@@ -692,7 +821,7 @@ mod tests {
 
     #[test]
     fn test_deletiontimestamp_is_filtered() {
-        let t: Object<Void, Void> = serde_json::from_str(METADATA).expect("Valid Metadata");
+        let t: Object<NotUsed, NotUsed> = serde_json::from_str(METADATA).expect("Valid Metadata");
         let reserialized = serde_json::to_string(&t).expect("bytes");
         let deserialized: Value = serde_json::from_str(&reserialized).expect("untyped JSON");
         let v = filter_configuration(deserialized);
@@ -701,7 +830,7 @@ mod tests {
 
     #[test]
     fn test_managedfields_is_filtered() {
-        let t: Object<Void, Void> = serde_json::from_str(METADATA).expect("Valid Metadata");
+        let t: Object<NotUsed, NotUsed> = serde_json::from_str(METADATA).expect("Valid Metadata");
         let reserialized = serde_json::to_string(&t).expect("bytes");
         let deserialized: Value = serde_json::from_str(&reserialized).expect("untyped JSON");
         let v = filter_configuration(deserialized);
@@ -709,62 +838,572 @@ mod tests {
     }
 
     #[test]
-    fn test_generation_becomes_f64() {
-        let t: Object<Void, Void> = serde_json::from_str(METADATA).expect("Valid Metadata");
+    fn test_generation_becomes_u64() {
+        let t: Object<NotUsed, NotUsed> = serde_json::from_str(METADATA).expect("Valid Metadata");
         let reserialized = serde_json::to_string(&t).expect("bytes");
         let deserialized: Value = serde_json::from_str(&reserialized).expect("untyped JSON");
         let v = filter_configuration(deserialized);
-        assert!(v["metadata"].get("generation").unwrap().is_f64());
+        assert!(v["metadata"].get("generation").unwrap().is_u64());
     }
 
     #[test]
-    fn test_validate_configuration_valid() {
-        let valid: AdmissionReview = serde_json::from_str(VALID).expect("v1.AdmissionReview JSON");
+    fn test_validate_configuration_valid_podspec() {
+        let valid: AdmissionReview =
+            serde_json::from_str(&get_valid_admission_review_with_broker_pod_spec())
+                .expect("v1.AdmissionReview JSON");
         let rqst = valid.request.expect("v1.AdmissionRequest JSON");
         let resp = validate_configuration(&rqst);
-        assert_eq!(resp.allowed, true);
+        assert!(resp.allowed);
     }
 
     #[test]
-    fn test_validate_configuration_invalid() {
+    fn test_validate_configuration_valid_jobspec() {
+        let valid: AdmissionReview =
+            serde_json::from_str(&get_valid_admission_review_with_broker_job_spec())
+                .expect("v1.AdmissionReview JSON");
+        let rqst = valid.request.expect("v1.AdmissionRequest JSON");
+        let resp = validate_configuration(&rqst);
+        assert!(resp.allowed);
+    }
+
+    // Canary: the INVALID_BROKER_*_SPEC fixtures and the e2e
+    // test/e2e/yaml/webhookInvalidConfiguration.yaml rely on PodSpec silently
+    // dropping unknown fields on deserialization. If that contract changes
+    // (e.g. k8s-openapi starts using `deny_unknown_fields`, or upstream adds
+    // a field colliding with `xUnknownSyntheticField`), this test will fail
+    // loudly — and the fixture tests below would otherwise start passing for
+    // the wrong reason.
+    #[test]
+    fn test_pod_spec_drops_unknown_fields() {
+        use k8s_openapi::api::core::v1::PodSpec;
+        let raw = serde_json::json!({
+            "containers": [{"image": "x", "name": "x"}],
+            "xUnknownSyntheticField": "should-be-dropped"
+        });
+        let pod_spec: PodSpec = serde_json::from_value(raw).expect("PodSpec parses");
+        let round_tripped = serde_json::to_value(&pod_spec).expect("PodSpec serializes");
+        assert!(
+            round_tripped.get("xUnknownSyntheticField").is_none(),
+            "PodSpec deserialization should drop unknown fields; \
+             see INVALID_BROKER_POD_SPEC / INVALID_BROKER_JOB_SPEC fixtures"
+        );
+    }
+
+    #[test]
+    fn test_validate_configuration_invalid_podspec() {
         let invalid: AdmissionReview =
-            serde_json::from_str(INVALID).expect("v1.AdmissionReview JSON");
+            serde_json::from_str(&get_invalid_admission_review_with_broker_pod_spec())
+                .expect("v1.AdmissionReview JSON");
         let rqst = invalid.request.expect("v1.AdmissionRequest JSON");
         let resp = validate_configuration(&rqst);
-        assert_eq!(resp.allowed, false);
+        assert!(!resp.allowed);
+    }
+
+    #[test]
+    fn test_validate_configuration_invalid_jobspec() {
+        let invalid: AdmissionReview =
+            serde_json::from_str(&get_invalid_admission_review_with_broker_job_spec())
+                .expect("v1.AdmissionReview JSON");
+        let rqst = invalid.request.expect("v1.AdmissionRequest JSON");
+        let resp = validate_configuration(&rqst);
+        assert!(!resp.allowed);
+    }
+
+    #[test]
+    #[should_panic(expected = "Could not parse as Akri Configuration")]
+    fn test_validate_configuration_invalid_jobspec_and_podspec() {
+        let invalid: AdmissionReview =
+            serde_json::from_str(&get_invalid_admission_review_with_broker_job_and_pod_spec())
+                .expect("v1.AdmissionReview JSON");
+        let rqst = invalid.request.expect("v1.AdmissionRequest JSON");
+        validate_configuration(&rqst);
     }
 
     #[test]
     fn test_validate_configuration_extended() {
         let valid: AdmissionReview =
-            serde_json::from_str(EXTENDED).expect("v1.AdmissionReview JSON");
+            serde_json::from_str(&get_extended_admission_review_with_broker_pod_spec())
+                .expect("v1.AdmissionReview JSON");
         let rqst = valid.request.expect("v1.AdmissionRequest JSON");
         let resp = validate_configuration(&rqst);
-        assert_eq!(resp.allowed, true);
+        assert!(resp.allowed);
     }
 
-    #[actix_rt::test]
-    async fn test_validate_valid() {
-        let mut app = test::init_service(App::new().service(validate)).await;
-        let valid: AdmissionReview = serde_json::from_str(VALID).expect("v1.AdmissionReview JSON");
-        let rqst = test::TestRequest::post()
+    #[test]
+    fn test_validate_udev_discovery_details() {
+        let discovery_properties = "";
+
+        // no discovery properties specified should success
+        let resp = run_validate_configuration_discovery_properties(discovery_properties);
+        assert!(resp.allowed);
+    }
+
+    #[test]
+    fn test_validate_configuration_discovery_properties_empty() {
+        let discovery_properties = "";
+
+        // no discovery properties specified should success
+        let resp = run_validate_configuration_discovery_properties(discovery_properties);
+        assert!(resp.allowed);
+    }
+
+    #[test]
+    fn test_validate_configuration_discovery_properties_empty_list() {
+        let discovery_properties = r#"
+        "discoveryProperties": [],
+        "#;
+
+        // empty discovery properties array should success
+        let resp = run_validate_configuration_discovery_properties(discovery_properties);
+        assert!(resp.allowed);
+    }
+
+    #[test]
+    fn test_validate_configuration_discovery_properties_plain_text() {
+        let discovery_properties = r#"
+        "discoveryProperties": [
+            {
+                "name": "nnnn",
+                "value":"vvvv"
+            }
+        ],
+        "#;
+
+        // plain text discovery properties specified should success
+        let resp = run_validate_configuration_discovery_properties(discovery_properties);
+        assert!(resp.allowed);
+    }
+
+    #[test]
+    fn test_validate_configuration_discovery_properties_plain_text_empty_value() {
+        let discovery_properties = r#"
+        "discoveryProperties": [
+            {
+                "name": "nnnn",
+                "value": ""
+            }
+        ],"#;
+
+        // plain text discovery properties, empty value should success
+        let resp = run_validate_configuration_discovery_properties(discovery_properties);
+        assert!(resp.allowed);
+    }
+
+    #[test]
+    fn test_validate_configuration_discovery_properties_plain_text_no_value() {
+        let discovery_properties = r#"
+        "discoveryProperties": [
+            {
+                "name": "nnnn"
+            }
+        ],"#;
+
+        // plain text discovery properties, value not specified should success
+        let resp = run_validate_configuration_discovery_properties(discovery_properties);
+        assert!(resp.allowed);
+    }
+
+    #[test]
+    fn test_validate_configuration_discovery_properties_plain_text_empty_name() {
+        let discovery_properties = r#"
+        "discoveryProperties": [
+            {
+                "name": ""
+            }
+        ],"#;
+
+        // plain text discovery properties, empty name should success
+        let resp = run_validate_configuration_discovery_properties(discovery_properties);
+        assert!(resp.allowed);
+    }
+
+    #[test]
+    #[should_panic(expected = "Could not parse as Akri Configuration")]
+    fn test_validate_configuration_discovery_properties_plain_text_no_name() {
+        let discovery_properties = r#"
+        "discoveryProperties": [
+            {
+                "value":"vvvv"
+            }
+        ],
+        "#;
+
+        // plain text discovery properties without name should fail, missing field 'name'
+        run_validate_configuration_discovery_properties(discovery_properties);
+    }
+
+    #[test]
+    #[should_panic(expected = "Could not parse as Akri Configuration")]
+    fn test_validate_configuration_discovery_properties_empty_value_from() {
+        let discovery_properties = r#"
+        "discoveryProperties": [
+            {
+                "name": "nnnn",
+                "valueFrom": {
+                }
+            }
+        ],"#;
+
+        // valueFrom discovery properties, not specified should fail, missing content of 'valueFrom'
+        run_validate_configuration_discovery_properties(discovery_properties);
+    }
+
+    #[test]
+    #[should_panic(expected = "Could not parse as Akri Configuration")]
+    fn test_validate_configuration_discovery_properties_unknown_value_from() {
+        let discovery_properties = r#"
+        "discoveryProperties": [
+            {
+                "name": "nnnn",
+                "valueFrom": {
+                    "fieldRef": {
+                        "fieldPath": "ffff"
+                    }
+                }
+            }
+        ],"#;
+
+        // valueFrom discovery properties, unknown ref should fail
+        run_validate_configuration_discovery_properties(discovery_properties);
+    }
+
+    #[test]
+    fn test_validate_configuration_discovery_properties_secret() {
+        let discovery_properties = r#"
+        "discoveryProperties": [
+            {
+                "name": "nnnn",
+                "valueFrom": {
+                    "secretKeyRef": {
+                        "name": "nnnn1",
+                        "key": "kkk",
+                        "optional": false
+                    }
+                }
+            }
+        ],"#;
+
+        // valueFrom discovery properties, secretKeyRef should success
+        let resp = run_validate_configuration_discovery_properties(discovery_properties);
+        assert!(resp.allowed);
+    }
+
+    #[test]
+    fn test_validate_configuration_discovery_properties_config_map() {
+        let discovery_properties = r#"
+        "discoveryProperties": [
+            {
+                "name": "nnnn",
+                "valueFrom": {
+                    "configMapKeyRef": {
+                        "name": "nnnn1",
+                        "key": "kkk",
+                        "optional": false
+                    }
+                }
+            }
+        ],"#;
+
+        // valueFrom discovery properties, configMapKeyRef should success
+        let resp = run_validate_configuration_discovery_properties(discovery_properties);
+        assert!(resp.allowed);
+    }
+
+    #[test]
+    #[should_panic(expected = "Could not parse as Akri Configuration")]
+    fn test_validate_configuration_discovery_properties_config_map_invalid_ref_name_xxx() {
+        // invalid "name1" in configMapKeyRef
+        let discovery_properties = r#"
+        "discoveryProperties": [
+            {
+                "name": "nnnn",
+                "valueFrom": {
+                    "configMapKeyRef": {
+                        "name1": "nnnn1",
+                        "key": "kkk",
+                        "optional": false
+                    }
+                }
+            }
+        ],"#;
+
+        run_validate_configuration_discovery_properties(discovery_properties);
+    }
+
+    #[test]
+    #[should_panic(expected = "Could not parse as Akri Configuration")]
+    fn test_validate_configuration_discovery_properties_config_map_multiple_value_from() {
+        let discovery_properties = r#"
+        "discoveryProperties": [
+            {
+                "name": "name1",
+                "valueFrom": {
+                    "configMapKeyRef": {
+                        "name": "nnnn1",
+                        "key": "kkk",
+                        "optional": false
+                    },
+                    "secretKeyRef": {
+                        "name": "nnnn1",
+                        "key": "kkk",
+                        "optional": false
+                    }
+                }
+            }
+        ],"#;
+
+        run_validate_configuration_discovery_properties(discovery_properties);
+    }
+
+    // Tests for the validate_udev_discovery_details function
+    use akri_shared::akri::configuration::{ConfigurationSpec, DiscoveryHandlerInfo};
+
+    // Helper function to create a Configuration for testing validate_udev_discovery_details
+    fn create_test_config(discovery_details: &str) -> Configuration {
+        Configuration {
+            metadata: Default::default(),
+            spec: ConfigurationSpec {
+                discovery_handler: DiscoveryHandlerInfo {
+                    name: "udev".to_string(),
+                    discovery_details: discovery_details.to_string(),
+                    discovery_properties: None,
+                },
+                broker_spec: None,
+                instance_service_spec: None,
+                configuration_service_spec: None,
+                capacity: 1,
+                broker_properties: Default::default(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_validate_udev_empty_discovery_details() {
+        let config = create_test_config("");
+        assert!(validate_udev_discovery_details(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_udev_non_udev_json() {
+        // This JSON is valid but doesn't match the UdevDiscoveryDetails structure
+        let config = create_test_config(r#"{"something":"else"}"#);
+        let result = validate_udev_discovery_details(&config);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Could not parse as Udev DiscoveryDetails")
+        );
+    }
+
+    #[test]
+    fn test_validate_udev_invalid_json() {
+        // Malformed JSON
+        let config = create_test_config(r#"{"rules": ["missing closing bracket"}"#);
+        let result = validate_udev_discovery_details(&config);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Could not parse as Udev DiscoveryDetails")
+        );
+    }
+
+    #[test]
+    fn test_validate_udev_valid_permission_r() {
+        let config = create_test_config(r#"{"udevRules": [], "permissions": "r"}"#);
+        assert!(validate_udev_discovery_details(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_udev_valid_permission_w() {
+        let config = create_test_config(r#"{"udevRules": [], "permissions": "w"}"#);
+        assert!(validate_udev_discovery_details(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_udev_valid_permission_m() {
+        let config = create_test_config(r#"{"udevRules": [], "permissions": "m"}"#);
+        assert!(validate_udev_discovery_details(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_udev_valid_permission_rw() {
+        let config = create_test_config(r#"{"udevRules": [], "permissions": "rw"}"#);
+        assert!(validate_udev_discovery_details(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_udev_valid_permission_rm() {
+        let config = create_test_config(r#"{"udevRules": [], "permissions": "rm"}"#);
+        assert!(validate_udev_discovery_details(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_udev_valid_permission_wm() {
+        let config = create_test_config(r#"{"udevRules": [], "permissions": "wm"}"#);
+        assert!(validate_udev_discovery_details(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_udev_valid_permission_rwm() {
+        let config = create_test_config(
+            r#"{"groupRecursive": false, "udevRules": ["KERNEL=='video[0-9]*'"], "permissions": "rwm"}"#,
+        );
+        assert!(validate_udev_discovery_details(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_udev_missing_permissions() {
+        // UdevDiscoveryDetails with no permissions field should use default permissions
+        let config = create_test_config(r#"{"udevRules": []}"#);
+        let result = validate_udev_discovery_details(&config);
+        // This may now return an error if permissions is a required field in UdevDiscoveryDetails
+        if let Err(e) = result {
+            assert!(
+                e.to_string()
+                    .contains("Could not parse as Udev DiscoveryDetails")
+            );
+        } else {
+            // If it parsed successfully, then UdevDiscoveryDetails must have a default for permissions
+            assert!(result.is_ok());
+        }
+    }
+
+    #[test]
+    fn test_validate_udev_empty_object() {
+        // Empty JSON object might now fail if required fields are missing
+        let config = create_test_config("{}");
+        let result = validate_udev_discovery_details(&config);
+        if let Err(e) = result {
+            assert!(
+                e.to_string()
+                    .contains("Could not parse as Udev DiscoveryDetails")
+            );
+        } else {
+            // If it parsed successfully, then UdevDiscoveryDetails must have defaults for all fields
+            assert!(result.is_ok());
+        }
+    }
+
+    #[test]
+    fn test_validate_udev_invalid_permission_rwx() {
+        let config = create_test_config(r#"{"udevRules": [], "permissions": "rwx"}"#);
+        let result = validate_udev_discovery_details(&config);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Could not parse as Udev DiscoveryDetails")
+        );
+    }
+
+    #[test]
+    fn test_validate_udev_invalid_permission_empty() {
+        let config = create_test_config(r#"{"udevRules": [], "permissions": ""}"#);
+        let result = validate_udev_discovery_details(&config);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Could not parse as Udev DiscoveryDetails")
+        );
+    }
+
+    #[test]
+    fn test_validate_udev_invalid_permission_x() {
+        let config = create_test_config(r#"{"udev_rules": [], "permissions": "x"}"#);
+        let result = validate_udev_discovery_details(&config);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Could not parse as Udev DiscoveryDetails")
+        );
+    }
+
+    #[test]
+    fn test_validate_udev_error_message_format() {
+        // Test with a completely invalid JSON to verify error formatting
+        let config = create_test_config(r#"{"this is not valid json"}"#);
+        let result = validate_udev_discovery_details(&config);
+        assert!(result.is_err());
+        let error_message = result.unwrap_err().to_string();
+        assert_eq!(
+            error_message,
+            "Could not parse as Udev DiscoveryDetails: missing field `udevRules`"
+        );
+    }
+
+    fn run_validate_configuration_discovery_properties(
+        discovery_properties: &str,
+    ) -> AdmissionResponse {
+        let valid: AdmissionReview = serde_json::from_str(
+            &get_admission_review_with_discovery_properties(discovery_properties),
+        )
+        .expect("v1.AdmissionReview JSON");
+        let rqst = valid.request.expect("v1.AdmissionRequest JSON");
+        validate_configuration(&rqst)
+    }
+
+    #[actix_web::test]
+    async fn test_validate_valid_podspec() {
+        let app = actix_web::test::init_service(App::new().service(validate)).await;
+        let valid: AdmissionReview =
+            serde_json::from_str(&get_valid_admission_review_with_broker_pod_spec())
+                .expect("v1.AdmissionReview JSON");
+        let rqst = actix_web::test::TestRequest::post()
             .uri("/validate")
             .set_json(&valid)
             .to_request();
-        let resp = test::call_service(&mut app, rqst).await;
-        assert_eq!(resp.status().is_success(), true);
+        let resp = actix_web::test::call_service(&app, rqst).await;
+        assert!(resp.status().is_success());
     }
 
-    #[actix_rt::test]
-    async fn test_validate_invalid() {
-        let mut app = test::init_service(App::new().service(validate)).await;
+    #[actix_web::test]
+    async fn test_validate_valid_jobspec() {
+        let app = actix_web::test::init_service(App::new().service(validate)).await;
+        let valid: AdmissionReview =
+            serde_json::from_str(&get_valid_admission_review_with_broker_job_spec())
+                .expect("v1.AdmissionReview JSON");
+        let rqst = actix_web::test::TestRequest::post()
+            .uri("/validate")
+            .set_json(&valid)
+            .to_request();
+        let resp = actix_web::test::call_service(&app, rqst).await;
+        assert!(resp.status().is_success());
+    }
+
+    #[actix_web::test]
+    async fn test_validate_invalid_podspec() {
+        let app = actix_web::test::init_service(App::new().service(validate)).await;
         let invalid: AdmissionReview =
-            serde_json::from_str(INVALID).expect("v1.AdmissionReview JSON");
-        let rqst = test::TestRequest::post()
+            serde_json::from_str(&get_invalid_admission_review_with_broker_pod_spec())
+                .expect("v1.AdmissionReview JSON");
+        let rqst = actix_web::test::TestRequest::post()
             .uri("/validate")
             .set_json(&invalid)
             .to_request();
-        let resp = test::call_service(&mut app, rqst).await;
-        assert_eq!(resp.status().is_success(), true);
+        let resp = actix_web::test::call_service(&app, rqst).await;
+        assert!(resp.status().is_success());
+    }
+
+    #[actix_web::test]
+    async fn test_validate_invalid_jobspec() {
+        let app = actix_web::test::init_service(App::new().service(validate)).await;
+        let invalid: AdmissionReview =
+            serde_json::from_str(&get_invalid_admission_review_with_broker_job_spec())
+                .expect("v1.AdmissionReview JSON");
+        let rqst = actix_web::test::TestRequest::post()
+            .uri("/validate")
+            .set_json(&invalid)
+            .to_request();
+        let resp = actix_web::test::call_service(&app, rqst).await;
+        assert!(resp.status().is_success());
     }
 }

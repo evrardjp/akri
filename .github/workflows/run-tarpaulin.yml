@@ -16,6 +16,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_VERSION: 1.88.0
 
 jobs:
   build:
@@ -31,16 +32,20 @@ jobs:
 
     steps:
     - name: Checkout the head commit of the branch
-      uses: actions/checkout@v2
+      uses: actions/checkout@v4
       with:
         persist-credentials: false
 
     - name: Create tarpaulin instance
-      run: docker create --network host --security-opt seccomp=unconfined -v "${PWD}:/volume" xd009642/tarpaulin:0.16.0 bash -c "echo 'sleep 600m; echo bye' > /tmp/keep_alive.sh; chmod 777 /tmp/keep_alive.sh; /tmp/keep_alive.sh" > container_id.txt
+      run: docker create --network host --security-opt seccomp=unconfined -v "${PWD}:/volume" xd009642/tarpaulin:0.27.1 bash -c "echo 'sleep 600m; echo bye' > /tmp/keep_alive.sh; chmod 777 /tmp/keep_alive.sh; /tmp/keep_alive.sh" > container_id.txt
     - name: Start tarpaulin instance
       run: docker start $(cat container_id.txt)
     - name: Install linux requirement in tarpaulin instance
-      run: docker exec $(cat container_id.txt) sh -c "echo Run apt update and apt install the following dependencies - git curl libssl-dev pkg-config libudev-dev libv4l-dev ; apt update ; apt install -y git curl libssl-dev pkg-config libudev-dev libv4l-dev"
+      run: docker exec $(cat container_id.txt) sh -c "echo Run apt update and apt install the following dependencies - git curl libssl-dev pkg-config libudev-dev libv4l-dev protobuf-compiler ; apt update ; apt install -y git curl libssl-dev pkg-config libudev-dev libv4l-dev protobuf-compiler"
+    - name: Install desired rust version
+      run: docker exec $(cat container_id.txt) sh -c "rustup install $CARGO_VERSION"
+    - name: Tell cargo to use desired rust version
+      run: docker exec $(cat container_id.txt) sh -c "rustup override set $CARGO_VERSION"
     - name: Install rust requirements in tarpaulin instance
       run: docker exec $(cat container_id.txt) sh -c "rustup component add rustfmt"
     - name: Run tarpaulin
@@ -48,14 +53,14 @@ jobs:
 
     - name: Upload report to codecov for push
       if: (!(startsWith(github.event_name, 'pull_request')))
-      uses: codecov/codecov-action@v1
+      uses: codecov/codecov-action@v5
       with:
         token: ${{secrets.CODECOV_TOKEN}}
         fail_ci_if_error: true
         verbose: true
 
     - name: Archive code coverage results
-      uses: actions/upload-artifact@v1
+      uses: actions/upload-artifact@v4
       with:
         name: code-coverage-report
         path: cobertura.xml

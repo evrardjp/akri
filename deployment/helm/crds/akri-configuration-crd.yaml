@@ -22,12 +22,68 @@ spec:
                       type: string
                     discoveryDetails:
                       type: string
+                    discoveryProperties:
+                      nullable: true
+                      type: array
+                      items: # {{DiscoveryProperty}}
+                        type: object
+                        required:
+                          - name
+                        properties:
+                          name:
+                            type: string
+                            pattern: "^[_A-Za-z][_A-Za-z0-9]*$"
+                          value:
+                            type: string
+                            nullable: true
+                          valueFrom:
+                            type: object
+                            properties:
+                              secretKeyRef:
+                                type: object
+                                required:
+                                  - name
+                                properties:
+                                  key:
+                                    type: string
+                                  name:
+                                    type: string
+                                  namespace:
+                                    type: string
+                                  optional:
+                                    type: boolean
+                              configMapKeyRef:
+                                type: object
+                                required:
+                                  - name
+                                properties:
+                                  key:
+                                    type: string
+                                  name:
+                                    type: string
+                                  namespace:
+                                    type: string
+                                  optional:
+                                    type: boolean
+                            oneOf:
+                              - required: ["secretKeyRef"]
+                              - required: ["configMapKeyRef"]
+                        oneOf:
+                          - required: ["value"]
+                          - required: ["valueFrom"]
                 capacity:
                   type: integer
-                brokerPodSpec: # {{PodSpec}}
-                  x-kubernetes-preserve-unknown-fields: true
+                brokerSpec: # {{BrokerSpec}}
                   type: object
-                  nullable: true
+                  properties:
+                    brokerJobSpec: # {{JobSpec}}
+                      x-kubernetes-preserve-unknown-fields: true
+                      type: object
+                      nullable: true
+                    brokerPodSpec: # {{PodSpec}}
+                      x-kubernetes-preserve-unknown-fields: true
+                      type: object
+                      nullable: true
                 instanceServiceSpec: # {{ServiceSpec}}
                   x-kubernetes-preserve-unknown-fields: true
                   type: object
@@ -55,3 +111,5 @@ spec:
     kind: Configuration
     shortNames:
       - akric
+    categories:
+      - all

@@ -1,21 +1,16 @@
 use super::{
     super::akri::API_NAMESPACE,
+    ERROR_NOT_FOUND, OwnershipInfo,
     pod::{
         AKRI_CONFIGURATION_LABEL_NAME, AKRI_INSTANCE_LABEL_NAME, APP_LABEL_ID, CONTROLLER_LABEL_ID,
     },
-    OwnershipInfo, ERROR_NOT_FOUND,
 };
 use either::Either;
-use k8s_openapi::api::core::v1::{Service, ServiceSpec, ServiceStatus};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{
-    ObjectMeta, OwnerReference as K8sOwnerReference,
-};
+use k8s_openapi::api::core::v1::{Service, ServiceSpec};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
 use kube::{
-    api::{
-        Api, DeleteParams, ListParams, Object, ObjectList, OwnerReference as KubeOwnerReference,
-        PatchParams, PostParams,
-    },
-    client::APIClient,
+    api::{Api, DeleteParams, ListParams, ObjectList, Patch, PatchParams, PostParams},
+    client::Client,
 };
 use log::{error, info, trace};
 use std::collections::BTreeMap;
@@ -26,33 +21,30 @@ use std::collections::BTreeMap;
 ///
 /// ```no_run
 /// use akri_shared::k8s::service;
-/// use kube::client::APIClient;
+/// use kube::client::Client;
 /// use kube::config;
 ///
 /// # #[tokio::main]
 /// # async fn main() {
 /// let selector = "environment=production,app=nginx";
-/// let api_client = APIClient::new(config::incluster_config().unwrap());
+/// let api_client = Client::try_default().await.unwrap();
 /// for svc in service::find_services_with_selector(&selector, api_client).await.unwrap() {
-///     println!("found svc: {}", svc.metadata.name)
+///     println!("found svc: {}", svc.metadata.name.unwrap())
 /// }
 /// # }
 /// ```
 pub async fn find_services_with_selector(
     selector: &str,
-    kube_client: APIClient,
-) -> Result<
-    ObjectList<Object<ServiceSpec, ServiceStatus>>,
-    Box<dyn std::error::Error + Send + Sync + 'static>,
-> {
+    kube_client: Client,
+) -> Result<ObjectList<Service>, anyhow::Error> {
     trace!("find_services_with_selector with selector={:?}", &selector);
-    let svcs = Api::v1Service(kube_client);
+    let svc_client: Api<Service> = Api::all(kube_client);
     let svc_list_params = ListParams {
         label_selector: Some(selector.to_string()),
         ..Default::default()
     };
     trace!("find_services_with_selector PRE svcs.list(...).await?");
-    let result = svcs.list(&svc_list_params).await;
+    let result = svc_client.list(&svc_list_params).await;
     trace!("find_services_with_selector return");
     Ok(result?)
 }
@@ -76,14 +68,14 @@ pub fn create_service_app_name(
     svc_suffix: &str,
     node_specific_svc: bool,
 ) -> String {
-    let normalized_instance_name = instance_name.replace(".", "-");
+    let normalized_instance_name = instance_name.replace('.', "-");
     if node_specific_svc {
         // If this is the node specific service, use the insrtance name which
         // contains node-specific content.
-        format!("{}-{}", normalized_instance_name, svc_suffix)
+        format!("{normalized_instance_name}-{svc_suffix}")
     } else {
         // If this is NOT the node specific service, use the capability name.
-        format!("{}-{}", configuration_name, svc_suffix)
+        format!("{configuration_name}-{svc_suffix}")
     }
 }
 
@@ -97,11 +89,13 @@ pub fn create_service_app_name(
 ///     OwnershipType,
 ///     service
 /// };
-/// use kube::client::APIClient;
+/// use kube::client::Client;
 /// use kube::config;
 /// use k8s_openapi::api::core::v1::ServiceSpec;
 ///
-/// let api_client = APIClient::new(config::incluster_config().unwrap());
+/// # #[tokio::main]
+/// # async fn main() {
+/// let api_client = Client::try_default().await.unwrap();
 /// let svc = service::create_new_service_from_spec(
 ///     "svc_namespace",
 ///     "capability_instance",
@@ -113,6 +107,7 @@ pub fn create_service_app_name(
 ///     ),
 ///     &ServiceSpec::default(),
 ///     true).unwrap();
+/// # }
 /// ```
 pub fn create_new_service_from_spec(
     svc_namespace: &str,
@@ -121,13 +116,9 @@ pub fn create_new_service_from_spec(
     ownership: OwnershipInfo,
     svc_spec: &ServiceSpec,
     node_specific_svc: bool,
-) -> Result<Service, Box<dyn std::error::Error + Send + Sync + 'static>> {
-    let app_name = create_service_app_name(
-        &configuration_name,
-        &instance_name,
-        &"svc".to_string(),
-        node_specific_svc,
-    );
+) -> anyhow::Result<Service> {
+    let app_name =
+        create_service_app_name(configuration_name, instance_name, "svc", node_specific_svc);
     let mut labels: BTreeMap<String, String> = BTreeMap::new();
     labels.insert(APP_LABEL_ID.to_string(), app_name.clone());
     labels.insert(CONTROLLER_LABEL_ID.to_string(), API_NAMESPACE.to_string());
@@ -143,25 +134,17 @@ pub fn create_new_service_from_spec(
         );
     }
 
-    let owner_references: Vec<K8sOwnerReference> = vec![K8sOwnerReference {
+    let owner_references: Vec<OwnerReference> = vec![OwnerReference {
         api_version: ownership.get_api_version(),
         kind: ownership.get_kind(),
-        controller: Some(ownership.get_controller()),
-        block_owner_deletion: Some(ownership.get_block_owner_deletion()),
+        controller: ownership.get_controller(),
+        block_owner_deletion: ownership.get_block_owner_deletion(),
         name: ownership.get_name(),
         uid: ownership.get_uid(),
     }];
 
     let mut spec = svc_spec.clone();
-    let mut modified_selector: BTreeMap<String, String>;
-    match spec.selector {
-        Some(selector) => {
-            modified_selector = selector;
-        }
-        None => {
-            modified_selector = BTreeMap::new();
-        }
-    }
+    let mut modified_selector: BTreeMap<String, String> = spec.selector.unwrap_or_default();
     modified_selector.insert(CONTROLLER_LABEL_ID.to_string(), API_NAMESPACE.to_string());
     if node_specific_svc {
         modified_selector.insert(
@@ -178,13 +161,13 @@ pub fn create_new_service_from_spec(
 
     let new_svc = Service {
         spec: Some(spec),
-        metadata: Some(ObjectMeta {
+        metadata: ObjectMeta {
             name: Some(app_name),
             namespace: Some(svc_namespace.to_string()),
             labels: Some(labels),
             owner_references: Some(owner_references),
             ..Default::default()
-        }),
+        },
         ..Default::default()
     };
 
@@ -201,13 +184,13 @@ pub fn create_new_service_from_spec(
 ///     OwnershipType,
 ///     service
 /// };
-/// use kube::client::APIClient;
+/// use kube::client::Client;
 /// use kube::config;
 ///
 /// # #[tokio::main]
 /// # async fn main() {
 /// let selector = "environment=production,app=nginx";
-/// let api_client = APIClient::new(config::incluster_config().unwrap());
+/// let api_client = Client::try_default().await.unwrap();
 /// for svc in service::find_services_with_selector(&selector, api_client).await.unwrap() {
 ///     let mut svc = svc;
 ///     service::update_ownership(
@@ -223,42 +206,195 @@ pub fn create_new_service_from_spec(
 /// # }
 /// ```
 pub fn update_ownership(
-    svc_to_update: &mut Object<ServiceSpec, ServiceStatus>,
+    svc_to_update: &mut Service,
     ownership: OwnershipInfo,
     replace_references: bool,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-    if replace_references {
+) -> anyhow::Result<()> {
+    let ownership_ref = OwnerReference {
+        api_version: ownership.get_api_version(),
+        kind: ownership.get_kind(),
+        controller: ownership.get_controller(),
+        block_owner_deletion: ownership.get_block_owner_deletion(),
+        name: ownership.get_name(),
+        uid: ownership.get_uid(),
+    };
+    if replace_references || svc_to_update.metadata.owner_references.is_none() {
         // Replace all existing ownerReferences with specified ownership
-        svc_to_update.metadata.ownerReferences = vec![KubeOwnerReference {
-            apiVersion: ownership.get_api_version(),
-            kind: ownership.get_kind(),
-            controller: ownership.get_controller(),
-            blockOwnerDeletion: ownership.get_block_owner_deletion(),
-            name: ownership.get_name(),
-            uid: ownership.get_uid(),
-        }];
-    } else {
+        svc_to_update.metadata.owner_references = Some(vec![ownership_ref]);
+    } else if let Some(refs) = svc_to_update.metadata.owner_references.as_mut() {
         // Add ownership to list IFF the UID doesn't already exist
-        if !svc_to_update
-            .metadata
-            .ownerReferences
-            .iter()
-            .any(|x| x.uid == ownership.get_uid())
-        {
-            svc_to_update
-                .metadata
-                .ownerReferences
-                .push(KubeOwnerReference {
-                    apiVersion: ownership.get_api_version(),
-                    kind: ownership.get_kind(),
-                    controller: ownership.get_controller(),
-                    blockOwnerDeletion: ownership.get_block_owner_deletion(),
-                    name: ownership.get_name(),
-                    uid: ownership.get_uid(),
-                });
+        if !refs.iter().any(|x| x.uid == ownership.get_uid()) {
+            refs.push(ownership_ref);
         }
     }
     Ok(())
+}
+
+/// Create Kubernetes Service
+///
+/// Example:
+///
+/// ```no_run
+/// use akri_shared::k8s::service;
+/// use kube::client::Client;
+/// use kube::config;
+/// use k8s_openapi::api::core::v1::Service;
+///
+/// # #[tokio::main]
+/// # async fn main() {
+/// let api_client = Client::try_default().await.unwrap();
+/// service::create_service(&Service::default(), "svc_namespace", api_client).await.unwrap();
+/// # }
+/// ```
+pub async fn create_service(
+    svc_to_create: &Service,
+    namespace: &str,
+    kube_client: Client,
+) -> Result<(), anyhow::Error> {
+    trace!("create_service enter");
+    let services: Api<Service> = Api::namespaced(kube_client, namespace);
+    info!("create_service svcs.create(...).await?:");
+    match services.create(&PostParams::default(), svc_to_create).await {
+        Ok(created_svc) => {
+            info!(
+                "create_service services.create return: {:?}",
+                created_svc.metadata.name
+            );
+            Ok(())
+        }
+        Err(kube::Error::Api(ae)) => {
+            error!(
+                "create_service services.create [{:?}] returned kube error: {:?}",
+                serde_json::to_string(&svc_to_create),
+                ae
+            );
+            Ok(())
+        }
+        Err(e) => {
+            error!(
+                "create_service services.create [{:?}] error: {:?}",
+                serde_json::to_string(&svc_to_create),
+                e
+            );
+            Err(anyhow::anyhow!(e))
+        }
+    }
+}
+
+/// Remove Kubernetes Service
+///
+/// Example:
+///
+/// ```no_run
+/// use akri_shared::k8s::service;
+/// use kube::client::Client;
+/// use kube::config;
+///
+/// # #[tokio::main]
+/// # async fn main() {
+/// let api_client = Client::try_default().await.unwrap();
+/// service::remove_service("svc_to_remove", "svc_namespace", api_client).await.unwrap();
+/// # }
+/// ```
+pub async fn remove_service(
+    svc_to_remove: &str,
+    namespace: &str,
+    kube_client: Client,
+) -> Result<(), anyhow::Error> {
+    trace!("remove_service enter");
+    let svcs: Api<Service> = Api::namespaced(kube_client, namespace);
+    info!("remove_service svcs.create(...).await?:");
+    match svcs.delete(svc_to_remove, &DeleteParams::default()).await {
+        Ok(deleted_svc) => match deleted_svc {
+            Either::Left(spec) => {
+                info!(
+                    "remove_service svcs.delete return: {:?}",
+                    &spec.metadata.name
+                );
+                Ok(())
+            }
+            Either::Right(status) => {
+                info!("remove_service svcs.delete return: {:?}", &status.status);
+                Ok(())
+            }
+        },
+        Err(kube::Error::Api(ae)) => {
+            if ae.code == ERROR_NOT_FOUND {
+                trace!("remove_service - service already deleted");
+                Ok(())
+            } else {
+                error!(
+                    "remove_service svcs.delete [{:?}] returned kube error: {:?}",
+                    &svc_to_remove, ae
+                );
+                Err(anyhow::anyhow!(ae))
+            }
+        }
+        Err(e) => {
+            error!(
+                "remove_service svcs.delete [{:?}] error: {:?}",
+                &svc_to_remove, e
+            );
+            Err(anyhow::anyhow!(e))
+        }
+    }
+}
+
+/// Update Kubernetes Service
+///
+/// Example:
+///
+/// ```no_run
+/// use akri_shared::k8s::service;
+/// use kube::client::Client;
+/// use kube::config;
+///
+/// # #[tokio::main]
+/// # async fn main() {
+/// let selector = "environment=production,app=nginx";
+/// let api_client = Client::try_default().await.unwrap();
+/// for svc in service::find_services_with_selector(&selector, api_client).await.unwrap() {
+///     let svc_name = &svc.metadata.name.clone().unwrap();
+///     let svc_namespace = &svc.metadata.namespace.as_ref().unwrap().clone();
+///     let loop_api_client = Client::try_default().await.unwrap();
+///     let updated_svc = service::update_service(
+///         &svc,
+///         &svc_name,
+///         &svc_namespace,
+///         loop_api_client).await.unwrap();
+/// }
+/// # }
+/// ```
+pub async fn update_service(
+    svc_to_update: &Service,
+    name: &str,
+    namespace: &str,
+    kube_client: Client,
+) -> Result<(), anyhow::Error> {
+    trace!(
+        "update_service enter name:{} namespace: {}",
+        &name, &namespace
+    );
+    let svcs: Api<Service> = Api::namespaced(kube_client, namespace);
+
+    info!("remove_service svcs.patch(...).await?:");
+    match svcs
+        .patch(name, &PatchParams::default(), &Patch::Merge(&svc_to_update))
+        .await
+    {
+        Ok(_service_modified) => {
+            log::trace!("update_service return");
+            Ok(())
+        }
+        Err(kube::Error::Api(ae)) => {
+            log::trace!("update_service kube_client.request returned kube error: {ae:?}");
+            Err(anyhow::anyhow!(ae))
+        }
+        Err(e) => {
+            log::trace!("update_service kube_client.request error: {e:?}");
+            Err(anyhow::anyhow!(e))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -267,8 +403,8 @@ mod svcspec_tests {
     use super::*;
     use env_logger;
 
-    use kube::api::{Object, ObjectMeta, TypeMeta};
-    pub type TestServiceObject = Object<ServiceSpec, ServiceStatus>;
+    use k8s_openapi::api::core::v1::ServiceStatus;
+    use kube::api::ObjectMeta;
 
     #[test]
     fn test_create_service_app_name() {
@@ -276,40 +412,20 @@ mod svcspec_tests {
 
         assert_eq!(
             "node-a-suffix",
-            create_service_app_name(
-                &"foo".to_string(),
-                &"node.a".to_string(),
-                &"suffix".to_string(),
-                true
-            )
+            create_service_app_name("foo", "node.a", "suffix", true)
         );
         assert_eq!(
             "foo-suffix",
-            create_service_app_name(
-                &"foo".to_string(),
-                &"node.a".to_string(),
-                &"suffix".to_string(),
-                false
-            )
+            create_service_app_name("foo", "node.a", "suffix", false)
         );
 
         assert_eq!(
             "node-a-suffix",
-            create_service_app_name(
-                &"foo".to_string(),
-                &"node-a".to_string(),
-                &"suffix".to_string(),
-                true
-            )
+            create_service_app_name("foo", "node-a", "suffix", true)
         );
         assert_eq!(
             "foo-suffix",
-            create_service_app_name(
-                &"foo".to_string(),
-                &"node-a".to_string(),
-                &"suffix".to_string(),
-                false
-            )
+            create_service_app_name("foo", "node-a", "suffix", false)
         );
     }
 
@@ -317,18 +433,13 @@ mod svcspec_tests {
     fn test_update_ownership_replace() {
         let _ = env_logger::builder().is_test(true).try_init();
 
-        let svc = TestServiceObject {
+        let mut svc = Service {
             metadata: ObjectMeta::default(),
-            spec: ServiceSpec::default(),
+            spec: Some(ServiceSpec::default()),
             status: Some(ServiceStatus::default()),
-            types: TypeMeta {
-                apiVersion: None,
-                kind: None,
-            },
         };
 
-        assert_eq!(0, svc.metadata.ownerReferences.len());
-        let mut svc = svc;
+        assert!(svc.metadata.owner_references.is_none());
         update_ownership(
             &mut svc,
             OwnershipInfo {
@@ -339,9 +450,15 @@ mod svcspec_tests {
             true,
         )
         .unwrap();
-        assert_eq!(1, svc.metadata.ownerReferences.len());
-        assert_eq!("object1", &svc.metadata.ownerReferences[0].name);
-        assert_eq!("uid1", &svc.metadata.ownerReferences[0].uid);
+        assert_eq!(1, svc.metadata.owner_references.as_ref().unwrap().len());
+        assert_eq!(
+            "object1",
+            &svc.metadata.owner_references.as_ref().unwrap()[0].name
+        );
+        assert_eq!(
+            "uid1",
+            &svc.metadata.owner_references.as_ref().unwrap()[0].uid
+        );
 
         update_ownership(
             &mut svc,
@@ -353,26 +470,28 @@ mod svcspec_tests {
             true,
         )
         .unwrap();
-        assert_eq!(1, svc.metadata.ownerReferences.len());
-        assert_eq!("object2", &svc.metadata.ownerReferences[0].name);
-        assert_eq!("uid2", &svc.metadata.ownerReferences[0].uid);
+        assert_eq!(1, svc.metadata.owner_references.as_ref().unwrap().len());
+        assert_eq!(
+            "object2",
+            &svc.metadata.owner_references.as_ref().unwrap()[0].name
+        );
+        assert_eq!(
+            "uid2",
+            &svc.metadata.owner_references.as_ref().unwrap()[0].uid
+        );
     }
 
     #[test]
     fn test_update_ownership_append() {
         let _ = env_logger::builder().is_test(true).try_init();
 
-        let svc = TestServiceObject {
+        let svc = Service {
             metadata: ObjectMeta::default(),
-            spec: ServiceSpec::default(),
+            spec: Some(ServiceSpec::default()),
             status: Some(ServiceStatus::default()),
-            types: TypeMeta {
-                apiVersion: None,
-                kind: None,
-            },
         };
 
-        assert_eq!(0, svc.metadata.ownerReferences.len());
+        assert!(svc.metadata.owner_references.is_none());
         let mut svc = svc;
         update_ownership(
             &mut svc,
@@ -384,9 +503,15 @@ mod svcspec_tests {
             false,
         )
         .unwrap();
-        assert_eq!(1, svc.metadata.ownerReferences.len());
-        assert_eq!("object1", &svc.metadata.ownerReferences[0].name);
-        assert_eq!("uid1", &svc.metadata.ownerReferences[0].uid);
+        assert_eq!(1, svc.metadata.owner_references.as_ref().unwrap().len());
+        assert_eq!(
+            "object1",
+            &svc.metadata.owner_references.as_ref().unwrap()[0].name
+        );
+        assert_eq!(
+            "uid1",
+            &svc.metadata.owner_references.as_ref().unwrap()[0].uid
+        );
 
         update_ownership(
             &mut svc,
@@ -398,11 +523,23 @@ mod svcspec_tests {
             false,
         )
         .unwrap();
-        assert_eq!(2, svc.metadata.ownerReferences.len());
-        assert_eq!("object1", &svc.metadata.ownerReferences[0].name);
-        assert_eq!("uid1", &svc.metadata.ownerReferences[0].uid);
-        assert_eq!("object2", &svc.metadata.ownerReferences[1].name);
-        assert_eq!("uid2", &svc.metadata.ownerReferences[1].uid);
+        assert_eq!(2, svc.metadata.owner_references.as_ref().unwrap().len());
+        assert_eq!(
+            "object1",
+            &svc.metadata.owner_references.as_ref().unwrap()[0].name
+        );
+        assert_eq!(
+            "uid1",
+            &svc.metadata.owner_references.as_ref().unwrap()[0].uid
+        );
+        assert_eq!(
+            "object2",
+            &svc.metadata.owner_references.as_ref().unwrap()[1].name
+        );
+        assert_eq!(
+            "uid2",
+            &svc.metadata.owner_references.as_ref().unwrap()[1].uid
+        );
 
         // Test that trying to add the same UID doesn't result in
         // duplicate
@@ -416,11 +553,23 @@ mod svcspec_tests {
             false,
         )
         .unwrap();
-        assert_eq!(2, svc.metadata.ownerReferences.len());
-        assert_eq!("object1", &svc.metadata.ownerReferences[0].name);
-        assert_eq!("uid1", &svc.metadata.ownerReferences[0].uid);
-        assert_eq!("object2", &svc.metadata.ownerReferences[1].name);
-        assert_eq!("uid2", &svc.metadata.ownerReferences[1].uid);
+        assert_eq!(2, svc.metadata.owner_references.as_ref().unwrap().len());
+        assert_eq!(
+            "object1",
+            &svc.metadata.owner_references.as_ref().unwrap()[0].name
+        );
+        assert_eq!(
+            "uid1",
+            &svc.metadata.owner_references.as_ref().unwrap()[0].uid
+        );
+        assert_eq!(
+            "object2",
+            &svc.metadata.owner_references.as_ref().unwrap()[1].name
+        );
+        assert_eq!(
+            "uid2",
+            &svc.metadata.owner_references.as_ref().unwrap()[1].uid
+        );
     }
 
     #[test]
@@ -458,23 +607,19 @@ mod svcspec_tests {
             let app_name = create_service_app_name(
                 &configuration_name,
                 &instance_name,
-                &"svc".to_string(),
+                "svc",
                 *node_specific_svc,
             );
 
             // Validate the metadata name/namesapce
-            assert_eq!(&app_name, &svc.metadata.clone().unwrap().name.unwrap());
-            assert_eq!(
-                &svc_namespace,
-                &svc.metadata.clone().unwrap().namespace.unwrap()
-            );
+            assert_eq!(&app_name, &svc.metadata.clone().name.unwrap());
+            assert_eq!(&svc_namespace, &svc.metadata.clone().namespace.unwrap());
 
             // Validate the labels added
             assert_eq!(
                 &&app_name,
                 &svc.metadata
                     .clone()
-                    .unwrap()
                     .labels
                     .unwrap()
                     .get(APP_LABEL_ID)
@@ -484,7 +629,6 @@ mod svcspec_tests {
                 &&API_NAMESPACE.to_string(),
                 &svc.metadata
                     .clone()
-                    .unwrap()
                     .labels
                     .unwrap()
                     .get(CONTROLLER_LABEL_ID)
@@ -495,7 +639,6 @@ mod svcspec_tests {
                     &&instance_name,
                     &svc.metadata
                         .clone()
-                        .unwrap()
                         .labels
                         .unwrap()
                         .get(AKRI_INSTANCE_LABEL_NAME)
@@ -506,7 +649,6 @@ mod svcspec_tests {
                     &&configuration_name,
                     &svc.metadata
                         .clone()
-                        .unwrap()
                         .labels
                         .unwrap()
                         .get(AKRI_CONFIGURATION_LABEL_NAME)
@@ -519,10 +661,10 @@ mod svcspec_tests {
                 object_name,
                 svc.metadata
                     .clone()
-                    .unwrap()
                     .owner_references
+                    .as_ref()
                     .unwrap()
-                    .get(0)
+                    .first()
                     .unwrap()
                     .name
             );
@@ -530,10 +672,10 @@ mod svcspec_tests {
                 object_uid,
                 svc.metadata
                     .clone()
-                    .unwrap()
                     .owner_references
+                    .as_ref()
                     .unwrap()
-                    .get(0)
+                    .first()
                     .unwrap()
                     .uid
             );
@@ -541,10 +683,10 @@ mod svcspec_tests {
                 "Pod",
                 &svc.metadata
                     .clone()
-                    .unwrap()
                     .owner_references
+                    .as_ref()
                     .unwrap()
-                    .get(0)
+                    .first()
                     .unwrap()
                     .kind
             );
@@ -552,37 +694,36 @@ mod svcspec_tests {
                 "core/v1",
                 &svc.metadata
                     .clone()
-                    .unwrap()
                     .owner_references
                     .unwrap()
-                    .get(0)
+                    .first()
                     .unwrap()
                     .api_version
             );
-            assert!(svc
-                .metadata
-                .clone()
-                .unwrap()
-                .owner_references
-                .unwrap()
-                .get(0)
-                .unwrap()
-                .controller
-                .unwrap());
-            assert!(svc
-                .metadata
-                .clone()
-                .unwrap()
-                .owner_references
-                .unwrap()
-                .get(0)
-                .unwrap()
-                .block_owner_deletion
-                .unwrap());
+            assert!(
+                svc.metadata
+                    .clone()
+                    .owner_references
+                    .unwrap()
+                    .first()
+                    .unwrap()
+                    .controller
+                    .unwrap()
+            );
+            assert!(
+                svc.metadata
+                    .clone()
+                    .owner_references
+                    .unwrap()
+                    .first()
+                    .unwrap()
+                    .block_owner_deletion
+                    .unwrap()
+            );
 
             // Validate the existing selector unchanged
             assert_eq!(
-                &&"this-node-selector".to_string(),
+                &&"this-node-selector",
                 &svc.spec
                     .as_ref()
                     .unwrap()
@@ -629,176 +770,6 @@ mod svcspec_tests {
                         .unwrap()
                 );
             }
-        }
-    }
-}
-
-/// Create Kubernetes Service
-///
-/// Example:
-///
-/// ```no_run
-/// use akri_shared::k8s::service;
-/// use kube::client::APIClient;
-/// use kube::config;
-/// use k8s_openapi::api::core::v1::Service;
-///
-/// # #[tokio::main]
-/// # async fn main() {
-/// let api_client = APIClient::new(config::incluster_config().unwrap());
-/// service::create_service(&Service::default(), "svc_namespace", api_client).await.unwrap();
-/// # }
-/// ```
-pub async fn create_service(
-    svc_to_create: &Service,
-    namespace: &str,
-    kube_client: APIClient,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-    trace!("create_service enter");
-    let services = Api::v1Service(kube_client).within(&namespace);
-    let svc_as_u8 = serde_json::to_vec(&svc_to_create)?;
-    info!("create_service svcs.create(...).await?:");
-    match services.create(&PostParams::default(), svc_as_u8).await {
-        Ok(created_svc) => {
-            info!(
-                "create_service services.create return: {:?}",
-                created_svc.metadata.name
-            );
-            Ok(())
-        }
-        Err(kube::Error::Api(ae)) => {
-            error!(
-                "create_service services.create [{:?}] returned kube error: {:?}",
-                serde_json::to_string(&svc_to_create),
-                ae
-            );
-            Ok(())
-        }
-        Err(e) => {
-            error!(
-                "create_service services.create [{:?}] error: {:?}",
-                serde_json::to_string(&svc_to_create),
-                e
-            );
-            Err(e.into())
-        }
-    }
-}
-
-/// Remove Kubernetes Service
-///
-/// Example:
-///
-/// ```no_run
-/// use akri_shared::k8s::service;
-/// use kube::client::APIClient;
-/// use kube::config;
-///
-/// # #[tokio::main]
-/// # async fn main() {
-/// let api_client = APIClient::new(config::incluster_config().unwrap());
-/// service::remove_service("svc_to_remove", "svc_namespace", api_client).await.unwrap();
-/// # }
-/// ```
-pub async fn remove_service(
-    svc_to_remove: &str,
-    namespace: &str,
-    kube_client: APIClient,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-    trace!("remove_service enter");
-    let svcs = Api::v1Service(kube_client).within(&namespace);
-    info!("remove_service svcs.create(...).await?:");
-    match svcs.delete(svc_to_remove, &DeleteParams::default()).await {
-        Ok(deleted_svc) => match deleted_svc {
-            Either::Left(spec) => {
-                info!(
-                    "remove_service svcs.delete return: {:?}",
-                    &spec.metadata.name
-                );
-                Ok(())
-            }
-            Either::Right(status) => {
-                info!("remove_service svcs.delete return: {:?}", &status.status);
-                Ok(())
-            }
-        },
-        Err(kube::Error::Api(ae)) => {
-            if ae.code == ERROR_NOT_FOUND {
-                trace!("remove_service - service already deleted");
-                Ok(())
-            } else {
-                error!(
-                    "remove_service svcs.delete [{:?}] returned kube error: {:?}",
-                    &svc_to_remove, ae
-                );
-                Err(ae.into())
-            }
-        }
-        Err(e) => {
-            error!(
-                "remove_service svcs.delete [{:?}] error: {:?}",
-                &svc_to_remove, e
-            );
-            Err(e.into())
-        }
-    }
-}
-
-/// Update Kubernetes Service
-///
-/// Example:
-///
-/// ```no_run
-/// use akri_shared::k8s::service;
-/// use kube::client::APIClient;
-/// use kube::config;
-///
-/// # #[tokio::main]
-/// # async fn main() {
-/// let selector = "environment=production,app=nginx";
-/// let api_client = APIClient::new(config::incluster_config().unwrap());
-/// for svc in service::find_services_with_selector(&selector, api_client).await.unwrap() {
-///     let svc_name = &svc.metadata.name.clone();
-///     let svc_namespace = &svc.metadata.namespace.as_ref().unwrap().clone();
-///     let loop_api_client = APIClient::new(config::incluster_config().unwrap());
-///     let updated_svc = service::update_service(
-///         &svc,
-///         &svc_name,
-///         &svc_namespace,
-///         loop_api_client).await.unwrap();
-/// }
-/// # }
-/// ```
-pub async fn update_service(
-    svc_to_update: &Object<ServiceSpec, ServiceStatus>,
-    name: &str,
-    namespace: &str,
-    kube_client: APIClient,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-    trace!(
-        "update_service enter name:{} namespace: {}",
-        &name,
-        &namespace
-    );
-    let svcs = Api::v1Service(kube_client).within(&namespace);
-    let svc_as_u8 = serde_json::to_vec(&svc_to_update)?;
-
-    info!("remove_service svcs.patch(...).await?:");
-    match svcs.patch(name, &PatchParams::default(), svc_as_u8).await {
-        Ok(_service_modified) => {
-            log::trace!("update_service return");
-            Ok(())
-        }
-        Err(kube::Error::Api(ae)) => {
-            log::trace!(
-                "update_service kube_client.request returned kube error: {:?}",
-                ae
-            );
-            Err(ae.into())
-        }
-        Err(e) => {
-            log::trace!("update_service kube_client.request error: {:?}", e);
-            Err(e.into())
         }
     }
 }

@@ -3,17 +3,19 @@ apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: akri-udev-discovery-daemonset
+  labels: {{- include "akri.labels" . | nindent 4 }}
+    app.kubernetes.io/name: akri-udev-discovery
+    app.kubernetes.io/component: discovery-handler
 spec:
   selector:
-    matchLabels:
-      name: akri-udev-discovery
+    matchLabels: {{- include "akri.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/name: akri-udev-discovery
   template:
     metadata:
-      labels:
-        name: akri-udev-discovery
+      labels: {{- include "akri.labels" . | nindent 8 }}
+        app.kubernetes.io/name: akri-udev-discovery
+        app.kubernetes.io/component: discovery-handler
     spec:
-      nodeSelector:
-        "kubernetes.io/os": linux
       containers:
       - name: akri-udev-discovery
         {{- if .Values.useDevelopmentContainers }}
@@ -64,10 +66,11 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- if .Values.udev.discovery.nodeSelectors }}
       nodeSelector:
-      {{- toYaml .Values.udev.discovery.nodeSelectors | nindent 8 }}
-      {{- end }}
+        "kubernetes.io/os": linux
+        {{- if .Values.udev.discovery.nodeSelectors }}
+          {{- toYaml .Values.udev.discovery.nodeSelectors | nindent 8 }}
+        {{- end }}
       volumes:
       - name: discovery-handlers
         hostPath:

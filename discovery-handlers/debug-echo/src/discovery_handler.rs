@@ -1,14 +1,14 @@
 use akri_discovery_utils::discovery::{
-    discovery_handler::{deserialize_discovery_details, DISCOVERED_DEVICES_CHANNEL_CAPACITY},
-    v0::{discovery_handler_server::DiscoveryHandler, Device, DiscoverRequest, DiscoverResponse},
     DiscoverStream,
+    discovery_handler::{DISCOVERED_DEVICES_CHANNEL_CAPACITY, deserialize_discovery_details},
+    v0::{Device, DiscoverRequest, DiscoverResponse, discovery_handler_server::DiscoveryHandler},
 };
 use async_trait::async_trait;
 use log::{error, info, trace};
 use std::time::Duration;
 use std::{collections::HashMap, fs};
 use tokio::sync::mpsc;
-use tokio::time::delay_for;
+use tokio::time::sleep;
 use tonic::{Response, Status};
 
 // TODO: make this configurable
@@ -55,11 +55,11 @@ impl DiscoveryHandler for DiscoveryHandlerImpl {
         info!("discover - called for debug echo protocol");
         let register_sender = self.register_sender.clone();
         let discover_request = request.get_ref();
-        let (mut discovered_devices_sender, discovered_devices_receiver) =
+        let (discovered_devices_sender, discovered_devices_receiver) =
             mpsc::channel(DISCOVERED_DEVICES_CHANNEL_CAPACITY);
         let discovery_handler_config: DebugEchoDiscoveryDetails =
             deserialize_discovery_details(&discover_request.discovery_details)
-                .map_err(|e| tonic::Status::new(tonic::Code::InvalidArgument, format!("{}", e)))?;
+                .map_err(|e| tonic::Status::new(tonic::Code::InvalidArgument, format!("{e}")))?;
         let descriptions = discovery_handler_config.descriptions;
         let mut offline = fs::read_to_string(DEBUG_ECHO_AVAILABILITY_CHECK_PATH)
             .unwrap_or_default()
@@ -67,6 +67,15 @@ impl DiscoveryHandler for DiscoveryHandlerImpl {
         let mut first_loop = true;
         tokio::spawn(async move {
             loop {
+                // Before each iteration, check if receiver has dropped
+                if discovered_devices_sender.is_closed() {
+                    error!("discover - channel closed ... attempting to re-register with Agent");
+                    if let Some(sender) = register_sender {
+                        sender.send(()).await.unwrap();
+                    }
+                    break;
+                }
+
                 let availability =
                     fs::read_to_string(DEBUG_ECHO_AVAILABILITY_CHECK_PATH).unwrap_or_default();
                 trace!(
@@ -85,8 +94,10 @@ impl DiscoveryHandler for DiscoveryHandlerImpl {
                         }))
                         .await
                     {
-                        error!("discover - for debugEcho failed to send discovery response with error {}", e);
-                        if let Some(mut sender) = register_sender {
+                        error!(
+                            "discover - for debugEcho failed to send discovery response with error {e}"
+                        );
+                        if let Some(sender) = register_sender {
                             sender.send(()).await.unwrap();
                         }
                         break;
@@ -117,17 +128,21 @@ impl DiscoveryHandler for DiscoveryHandlerImpl {
                         .await
                     {
                         // TODO: consider re-registering here
-                        error!("discover - for debugEcho failed to send discovery response with error {}", e);
-                        if let Some(mut sender) = register_sender {
+                        error!(
+                            "discover - for debugEcho failed to send discovery response with error {e}"
+                        );
+                        if let Some(sender) = register_sender {
                             sender.send(()).await.unwrap();
                         }
                         break;
                     }
                 }
-                delay_for(Duration::from_secs(DISCOVERY_INTERVAL_SECS)).await;
+                sleep(Duration::from_secs(DISCOVERY_INTERVAL_SECS)).await;
             }
         });
-        Ok(Response::new(discovered_devices_receiver))
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            discovered_devices_receiver,
+        )))
     }
 }
 
@@ -172,7 +187,7 @@ mod tests {
               descriptions:
               - "foo1"
         "#;
-        let deserialized: DiscoveryHandlerInfo = serde_yaml::from_str(&debug_echo_yaml).unwrap();
+        let deserialized: DiscoveryHandlerInfo = serde_yaml::from_str(debug_echo_yaml).unwrap();
         let discovery_handler = DiscoveryHandlerImpl::new(None);
         let properties: HashMap<String, String> = [(
             super::super::DEBUG_ECHO_DESCRIPTION_LABEL.to_string(),
@@ -189,11 +204,13 @@ mod tests {
         };
         let discover_request = tonic::Request::new(DiscoverRequest {
             discovery_details: deserialized.discovery_details.clone(),
+            discovery_properties: HashMap::new(),
         });
         let mut stream = discovery_handler
             .discover(discover_request)
             .await
             .unwrap()
+            .into_inner()
             .into_inner();
         let devices = stream.recv().await.unwrap().unwrap().devices;
         assert_eq!(1, devices.len());

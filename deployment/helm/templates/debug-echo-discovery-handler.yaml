@@ -3,14 +3,18 @@ apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: akri-debug-echo-discovery-daemonset
+  labels: {{- include "akri.labels" . | nindent 4 }}
+    app.kubernetes.io/name: akri-debug-echo-discovery
+    app.kubernetes.io/component: discovery-handler
 spec:
   selector:
-    matchLabels:
-      name: akri-debug-echo-discovery
+    matchLabels: {{- include "akri.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/name: akri-debug-echo-discovery
   template:
     metadata:
-      labels:
-        name: akri-debug-echo-discovery
+      labels: {{- include "akri.labels" . | nindent 8 }}
+        app.kubernetes.io/name: akri-debug-echo-discovery
+        app.kubernetes.io/component: discovery-handler
     spec:
       containers:
       - name: akri-debug-echo-discovery
@@ -60,10 +64,11 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- if .Values.debugEcho.discovery.nodeSelectors }}
       nodeSelector:
-      {{- toYaml .Values.debugEcho.discovery.nodeSelectors | nindent 8 }}
-      {{- end }}
+        "kubernetes.io/os": linux
+        {{- if .Values.debugEcho.discovery.nodeSelectors }}
+          {{- toYaml .Values.debugEcho.discovery.nodeSelectors | nindent 8 }}
+        {{- end }}
       volumes:
       - name: discovery-handlers
         hostPath:

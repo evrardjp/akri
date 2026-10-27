@@ -1,11 +1,12 @@
 use super::discovery::v0::{
-    registration_client::RegistrationClient, RegisterDiscoveryHandlerRequest,
+    RegisterDiscoveryHandlerRequest, registration_client::RegistrationClient,
 };
+use hyper_util::rt::TokioIo;
 use log::{info, trace};
 use std::convert::TryFrom;
 use tonic::{
-    transport::{Endpoint, Uri},
     Request,
+    transport::{Endpoint, Uri},
 };
 
 pub async fn register_discovery_handler(
@@ -14,9 +15,14 @@ pub async fn register_discovery_handler(
     info!("register_discovery_handler - entered");
     loop {
         // We will ignore this dummy uri because UDS does not use it.
-        if let Ok(channel) = Endpoint::try_from("dummy://[::]:50051")?
-            .connect_with_connector(tower::service_fn(move |_: Uri| {
+        // Some servers will check the uri content so the uri needs to
+        // be in valid format even it's not used, the scheme part is used
+        // to specific what scheme to use, such as http or https
+        if let Ok(channel) = Endpoint::try_from("http://[::1]:50051")?
+            .connect_with_connector(tower::service_fn(move |_: Uri| async move {
                 tokio::net::UnixStream::connect(super::get_registration_socket())
+                    .await
+                    .map(TokioIo::new)
             }))
             .await
         {
@@ -26,7 +32,7 @@ pub async fn register_discovery_handler(
             break;
         }
         trace!("register_discovery_handler - sleeping for 10 seconds and trying again");
-        tokio::time::delay_for(std::time::Duration::from_secs(10)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
     }
     Ok(())
 }

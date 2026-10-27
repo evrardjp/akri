@@ -1,25 +1,22 @@
 use super::super::BROKER_POD_COUNT_METRIC;
 use super::{pod_action::PodAction, pod_action::PodActionInfo};
 use akri_shared::{
-    akri::{
-        configuration::KubeAkriConfig, instance::KubeAkriInstance, AKRI_PREFIX, API_INSTANCES,
-        API_NAMESPACE, API_VERSION,
-    },
-    k8s,
+    akri::{AKRI_PREFIX, configuration::BrokerSpec, instance::Instance},
     k8s::{
-        pod,
+        self, KubeInterface, OwnershipInfo, OwnershipType, job, pod,
         pod::{AKRI_INSTANCE_LABEL_NAME, AKRI_TARGET_NODE_LABEL_NAME},
-        KubeInterface, OwnershipInfo, OwnershipType,
     },
 };
-use async_std::sync::Mutex;
-use futures::StreamExt;
-use k8s_openapi::api::core::v1::{PodSpec, PodStatus};
-use kube::api::{Informer, Object, RawApi, WatchEvent};
+use futures::{StreamExt, TryStreamExt};
+use k8s_openapi::api::batch::v1::JobSpec;
+use k8s_openapi::api::core::v1::{Pod, PodSpec};
+use kube::api::Api;
+use kube::runtime::WatchStreamExt;
+use kube::runtime::watcher::{Config, Event, watcher};
 use log::{error, info, trace};
 use std::collections::HashMap;
 use std::sync::Arc;
-
+use tokio::sync::Mutex;
 /// Length of time a Pod can be pending before we give up and retry
 pub const PENDING_POD_GRACE_PERIOD_MINUTES: i64 = 5;
 /// Length of time a Pod can be in an error state before we retry
@@ -27,8 +24,23 @@ pub const FAILED_POD_GRACE_PERIOD_MINUTES: i64 = 0;
 
 /// Instance action types
 ///
-/// Instance actions describe the types of actions the controller can
-/// react to for DeviceCapabiltiyInstances.
+/// Instance actions describe the types of actions the Controller can
+/// react to for Instances.
+///
+/// This will determine what broker management actions to take (if any)
+///
+///   | --> InstanceAction::Add
+///                 | --> No broker => Do nothing
+///                 | --> <BrokerSpec::BrokerJobSpec> => Deploy a Job
+///                 | --> <BrokerSpec::BrokerPodSpec> => Deploy Pod to each Node on Instance's `nodes` list (up to `capacity` total)
+///   | --> InstanceAction::Remove
+///                 | --> No broker => Do nothing
+///                 | --> <BrokerSpec::BrokerJobSpec> => Delete all Jobs labeled with the Instance name
+///                 | --> <BrokerSpec::BrokerPodSpec> => Delete all Pods labeled with the Instance name
+///   | --> InstanceAction::Update
+///                 | --> No broker => Do nothing
+///                 | --> <BrokerSpec::BrokerJobSpec> => No nothing
+///                 | --> <BrokerSpec::BrokerPodSpec> => Ensure that each Node on Instance's `nodes` list (up to `capacity` total) have a Pod
 ///
 #[derive(Clone, Debug, PartialEq)]
 pub enum InstanceAction {
@@ -41,9 +53,9 @@ pub enum InstanceAction {
 }
 
 /// This invokes an internal method that watches for Instance events
-pub async fn handle_existing_instances(
-) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-    internal_handle_existing_instances(&k8s::create_kube_interface()).await
+pub async fn handle_existing_instances()
+-> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    internal_handle_existing_instances(&k8s::KubeImpl::new().await?).await
 }
 
 /// This invokes an internal method that watches for Instance events
@@ -51,7 +63,7 @@ pub async fn do_instance_watch(
     synchronization: Arc<Mutex<()>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     // Watch for instance changes
-    internal_do_instance_watch(&synchronization, &k8s::create_kube_interface()).await
+    internal_do_instance_watch(&synchronization, &k8s::KubeImpl::new().await?).await
 }
 
 /// This invokes an internal method that watches for Instance events
@@ -64,7 +76,7 @@ async fn internal_handle_existing_instances(
     let pre_existing_instances = kube_interface.get_instances().await?;
     for instance in pre_existing_instances {
         tasks.push(tokio::spawn(async move {
-            let inner_kube_interface = k8s::create_kube_interface();
+            let inner_kube_interface = k8s::KubeImpl::new().await.unwrap();
             handle_instance_change(&instance, &InstanceAction::Update, &inner_kube_interface)
                 .await
                 .unwrap();
@@ -74,72 +86,74 @@ async fn internal_handle_existing_instances(
     Ok(())
 }
 
-/// This watches for Instance events
 async fn internal_do_instance_watch(
     synchronization: &Arc<Mutex<()>>,
     kube_interface: &impl KubeInterface,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     trace!("internal_do_instance_watch - enter");
-    let akri_instance_type = RawApi::customResource(API_INSTANCES)
-        .group(API_NAMESPACE)
-        .version(API_VERSION);
-
-    let informer = Informer::raw(kube_interface.get_kube_client(), akri_instance_type)
-        .init()
-        .await?;
+    let resource = Api::<Instance>::all(kube_interface.get_kube_client());
+    let watcher = watcher(resource, Config::default()).default_backoff();
+    let mut informer = watcher.boxed();
+    let mut first_event = true;
+    // Currently, this does not handle None except to break the loop.
     loop {
-        let mut instances = informer.poll().await?.boxed();
-
-        // Currently, this does not handle None except to break the
-        // while.
-        while let Some(event) = instances.next().await {
-            // Aquire lock to ensure cleanup_instance_and_configuration_svcs and the
-            // inner loop handle_instance call in internal_do_instance_watch
-            // cannot execute at the same time.
-            let _lock = synchronization.lock().await;
-            trace!("internal_do_instance_watch - aquired sync lock");
-            handle_instance(event?, kube_interface).await?;
-        }
+        let event = match informer.try_next().await {
+            Err(e) => {
+                error!("Error during watch: {e}");
+                continue;
+            }
+            Ok(None) => break,
+            Ok(Some(event)) => event,
+        };
+        // Acquire lock to ensure cleanup_instance_and_configuration_svcs and the
+        // inner loop handle_instance call in internal_do_instance_watch
+        // cannot execute at the same time.
+        let _lock = synchronization.lock().await;
+        trace!("internal_do_instance_watch - acquired sync lock");
+        handle_instance(event, kube_interface, &mut first_event).await?;
     }
+    Ok(())
 }
 
 /// This takes an event off the Instance stream and delegates it to the
 /// correct function based on the event type.
 async fn handle_instance(
-    event: WatchEvent<KubeAkriInstance>,
+    event: Event<Instance>,
     kube_interface: &impl KubeInterface,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    first_event: &mut bool,
+) -> anyhow::Result<()> {
     trace!("handle_instance - enter");
     match event {
-        WatchEvent::Added(instance) => {
+        Event::Apply(instance) => {
             info!(
-                "handle_instance - added Akri Instance {}: {:?}",
+                "handle_instance - added or modified Akri Instance {:?}: {:?}",
                 instance.metadata.name, instance.spec
             );
+            // TODO: consider renaming `InstanceAction::Add` to `InstanceAction::AddOrUpdate`
+            // to reflect that this could also be an Update event. Or as we do more specific
+            // inspection in future, delineation may be useful.
             handle_instance_change(&instance, &InstanceAction::Add, kube_interface).await?;
-            Ok(())
         }
-        WatchEvent::Deleted(instance) => {
+        Event::Delete(instance) => {
             info!(
-                "handle_instance - deleted Akri Instance {}: {:?}",
+                "handle_instance - deleted Akri Instance {:?}: {:?}",
                 instance.metadata.name, instance.spec
             );
             handle_instance_change(&instance, &InstanceAction::Remove, kube_interface).await?;
-            Ok(())
         }
-        WatchEvent::Modified(instance) => {
-            info!(
-                "handle_instance - modified Akri Instance {}: {:?}",
-                instance.metadata.name, instance.spec
-            );
-            handle_instance_change(&instance, &InstanceAction::Update, kube_interface).await?;
-            Ok(())
+        Event::Init => {
+            if *first_event {
+                info!("handle_instance - watcher started");
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Instance watcher restarted - throwing error to restart controller"
+                ));
+            }
         }
-        WatchEvent::Error(ref e) => {
-            trace!("handle_instance - error for Akri Instance: {}", e);
-            Ok(())
-        }
+        Event::InitApply(_) | Event::InitDone => {}
     }
+    *first_event = false;
+    Ok(())
 }
 
 /// PodContext stores a set of details required to track/create/delete broker
@@ -151,78 +165,53 @@ async fn handle_instance(
 /// * the node is described by node_name
 /// * the protocol (or capability) is described by instance_name and namespace
 /// * what to do with the broker Pod is described by action
+// TODO: add Pod name so does not need to be
+// generated on deletes and remove Option wrappers.
 #[derive(Clone, Debug, PartialEq)]
-struct PodContext {
-    node_name: Option<String>,
+pub(crate) struct PodContext {
+    pub(crate) node_name: Option<String>,
     namespace: Option<String>,
     action: PodAction,
+}
+
+pub(crate) fn create_pod_context(k8s_pod: &Pod, action: PodAction) -> anyhow::Result<PodContext> {
+    let pod_name = k8s_pod.metadata.name.as_ref().unwrap();
+    let labels = &k8s_pod
+        .metadata
+        .labels
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no labels found for Pod {pod_name:?}"))?;
+    // Early exits above ensure unwrap will not panic
+    let node_to_run_pod_on = labels.get(AKRI_TARGET_NODE_LABEL_NAME).ok_or_else(|| {
+        anyhow::anyhow!("no {AKRI_TARGET_NODE_LABEL_NAME} label found for {pod_name:?}")
+    })?;
+
+    Ok(PodContext {
+        node_name: Some(node_to_run_pod_on.to_string()),
+        namespace: k8s_pod.metadata.namespace.clone(),
+        action,
+    })
 }
 
 /// This finds what to do with a given broker Pod based on its current state and
 /// the Instance event action.  If this method has enough information,
 /// it will update the nodes_to_act_on map with the required action.
 fn determine_action_for_pod(
-    k8s_pod: &Object<PodSpec, PodStatus>,
+    k8s_pod: &Pod,
     action: &InstanceAction,
     nodes_to_act_on: &mut HashMap<String, PodContext>,
-) {
-    if k8s_pod.status.is_none() {
-        error!(
-            "determine_action_for_pod - no pod status found for {}",
-            &k8s_pod.metadata.name
-        );
-        return;
-    }
+) -> anyhow::Result<()> {
+    let pod_name = k8s_pod.metadata.name.as_ref().unwrap();
+    let pod_phase = k8s_pod
+        .status
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("No pod status found for Pod {pod_name:?}"))?
+        .phase
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("No pod phase found for Pod {pod_name:?}"))?;
 
-    if k8s_pod.status.as_ref().unwrap().phase.is_none() {
-        error!(
-            "determine_action_for_pod - no pod phase found for {}",
-            &k8s_pod.metadata.name
-        );
-        return;
-    }
-
-    // Early exits above ensure unwrap will not panic
-    let pod_phase = k8s_pod.status.as_ref().unwrap().phase.as_ref().unwrap();
-
-    if k8s_pod
-        .metadata
-        .labels
-        .get(AKRI_TARGET_NODE_LABEL_NAME)
-        .is_none()
-    {
-        error!(
-            "determine_action_for_pod - no {} label found for {}",
-            AKRI_TARGET_NODE_LABEL_NAME, &k8s_pod.metadata.name
-        );
-        return;
-    }
-
-    // Early exits above ensure unwrap will not panic
-    let node_to_run_pod_on = k8s_pod
-        .metadata
-        .labels
-        .get(AKRI_TARGET_NODE_LABEL_NAME)
-        .unwrap();
-
-    if k8s_pod
-        .metadata
-        .labels
-        .get(AKRI_INSTANCE_LABEL_NAME)
-        .is_none()
-    {
-        error!(
-            "determine_action_for_pod - no {} label found for {}",
-            AKRI_INSTANCE_LABEL_NAME, &k8s_pod.metadata.name
-        );
-        return;
-    }
-
-    let mut update_pod_context = PodContext {
-        node_name: Some(node_to_run_pod_on.to_string()),
-        namespace: k8s_pod.metadata.namespace.clone(),
-        action: PodAction::NoAction,
-    };
+    let mut update_pod_context = create_pod_context(k8s_pod, PodAction::NoAction)?;
+    let node_to_run_pod_on = update_pod_context.node_name.as_ref().unwrap();
 
     // Early exits above ensure unwrap will not panic
     let pod_start_time = k8s_pod.status.as_ref().unwrap().start_time.clone();
@@ -234,19 +223,11 @@ fn determine_action_for_pod(
         instance_action: action.clone(),
         status_start_time: pod_start_time,
         unknown_node: !nodes_to_act_on.contains_key(node_to_run_pod_on),
-        trace_node_name: k8s_pod.metadata.name.clone(),
+        trace_node_name: k8s_pod.metadata.name.clone().unwrap(),
     };
-    update_pod_context.action = match pod_action_info.select_pod_action() {
-        Ok(action) => action,
-        Err(e) => {
-            error!(
-                "determine_action_for_pod - failed ({}) to get pod action for {:?}",
-                e, update_pod_context
-            );
-            return;
-        }
-    };
+    update_pod_context.action = pod_action_info.select_pod_action()?;
     nodes_to_act_on.insert(node_to_run_pod_on.to_string(), update_pod_context);
+    Ok(())
 }
 
 /// This handles Instance deletion event by deleting the
@@ -259,36 +240,34 @@ async fn handle_deletion_work(
     node_to_delete_pod: &str,
     context: &PodContext,
     kube_interface: &impl KubeInterface,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-    let context_node_name = context.node_name.as_ref().ok_or(format!(
-        "handle_deletion_work - Context node_name is missing for {}: {:?}",
-        node_to_delete_pod, context
-    ))?;
-    let context_namespace = context.namespace.as_ref().ok_or(format!(
-        "handle_deletion_work - Context namespace is missing for {}: {:?}",
-        node_to_delete_pod, context
-    ))?;
+) -> anyhow::Result<()> {
+    let context_node_name = context.node_name.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "handle_deletion_work - Context node_name is missing for {node_to_delete_pod}: {context:?}"
+        )
+    })?;
+    let context_namespace = context.namespace.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "handle_deletion_work - Context namespace is missing for {node_to_delete_pod}: {context:?}"
+        )
+    })?;
 
     trace!(
-        "handle_deletion_work - pod::create_pod_app_name({:?}, {:?}, {:?}, {:?})",
-        &instance_name,
-        context_node_name,
-        instance_shared,
-        &"pod".to_string()
+        "handle_deletion_work - pod::create_broker_app_name({:?}, {:?}, {:?}, {:?})",
+        &instance_name, context_node_name, instance_shared, "pod"
     );
-    let pod_app_name = pod::create_pod_app_name(
-        &instance_name,
-        context_node_name,
+    let pod_app_name = pod::create_broker_app_name(
+        instance_name,
+        Some(context_node_name),
         instance_shared,
-        &"pod".to_string(),
+        "pod",
     );
     trace!(
         "handle_deletion_work - pod::remove_pod name={:?}, namespace={:?}",
-        &pod_app_name,
-        &context_namespace
+        &pod_app_name, &context_namespace
     );
     kube_interface
-        .remove_pod(&pod_app_name, &context_namespace)
+        .remove_pod(&pod_app_name, context_namespace)
         .await?;
     trace!("handle_deletion_work - pod::remove_pod succeeded",);
     BROKER_POD_COUNT_METRIC
@@ -312,16 +291,18 @@ mod handle_deletion_work_tests {
             action: PodAction::NoAction,
         };
 
-        assert!(handle_deletion_work(
-            "instance_name",
-            "configuration_name",
-            true,
-            "node_to_delete_pod",
-            &context,
-            &MockKubeInterface::new(),
-        )
-        .await
-        .is_err());
+        assert!(
+            handle_deletion_work(
+                "instance_name",
+                "configuration_name",
+                true,
+                "node_to_delete_pod",
+                &context,
+                &MockKubeInterface::new(),
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -334,21 +315,26 @@ mod handle_deletion_work_tests {
             action: PodAction::NoAction,
         };
 
-        assert!(handle_deletion_work(
-            "instance_name",
-            "configuration_name",
-            true,
-            "node_to_delete_pod",
-            &context,
-            &MockKubeInterface::new(),
-        )
-        .await
-        .is_err());
+        assert!(
+            handle_deletion_work(
+                "instance_name",
+                "configuration_name",
+                true,
+                "node_to_delete_pod",
+                &context,
+                &MockKubeInterface::new(),
+            )
+            .await
+            .is_err()
+        );
     }
 }
 
 /// This handles Instance addition event by creating the
 /// broker Pod, the broker Service, and the capability Service.
+/// TODO: reduce parameters by passing Instance object instead of
+/// individual fields
+#[allow(clippy::too_many_arguments)]
 async fn handle_addition_work(
     instance_name: &str,
     instance_uid: &str,
@@ -356,65 +342,181 @@ async fn handle_addition_work(
     instance_class_name: &str,
     instance_shared: bool,
     new_node: &str,
-    instance_configuration: &KubeAkriConfig,
+    podspec: &PodSpec,
     kube_interface: &impl KubeInterface,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-    trace!(
-        "handle_addition_work - Create new Pod for Node={:?}",
-        new_node
-    );
+) -> anyhow::Result<()> {
+    trace!("handle_addition_work - Create new Pod for Node={new_node:?}");
+    let capability_id = format!("{AKRI_PREFIX}/{instance_name}");
+    let new_pod = pod::create_new_pod_from_spec(
+        instance_namespace,
+        instance_name,
+        instance_class_name,
+        OwnershipInfo::new(
+            OwnershipType::Instance,
+            instance_name.to_string(),
+            instance_uid.to_string(),
+        ),
+        &capability_id,
+        new_node,
+        instance_shared,
+        podspec,
+    )?;
 
-    if let Some(broker_pod_spec) = &instance_configuration.spec.broker_pod_spec {
-        let capability_id = format!("{}/{}", AKRI_PREFIX, instance_name);
-        let new_pod = pod::create_new_pod_from_spec(
-            &instance_namespace,
-            &instance_name,
-            &instance_class_name,
-            OwnershipInfo::new(
-                OwnershipType::Instance,
-                instance_name.to_string(),
-                instance_uid.to_string(),
-            ),
-            &capability_id,
-            &new_node.to_string(),
-            instance_shared,
-            &broker_pod_spec,
-        )?;
+    trace!("handle_addition_work - New pod spec={new_pod:?}");
 
-        trace!("handle_addition_work - New pod spec={:?}", new_pod);
+    kube_interface
+        .create_pod(&new_pod, instance_namespace)
+        .await?;
+    trace!("handle_addition_work - pod::create_pod succeeded",);
+    BROKER_POD_COUNT_METRIC
+        .with_label_values(&[instance_class_name, new_node])
+        .inc();
 
-        kube_interface
-            .create_pod(&new_pod, &instance_namespace)
-            .await?;
-        trace!("handle_addition_work - pod::create_pod succeeded",);
-        BROKER_POD_COUNT_METRIC
-            .with_label_values(&[instance_class_name, new_node])
-            .inc();
-    }
-    trace!("handle_addition_work - POST nodeInfo.SetNode \n");
     Ok(())
 }
 
-/// Handle Instance change by watching for node
-/// disappearances, starting broker Pods/Services that are missing,
-/// and stopping Pods/Services that are no longer needed.
+/// Handle Instance change by
+/// 1) checking to make sure the Instance's Configuration exists
+/// 2) calling the appropriate handler depending on the broker type (Pod or Job) if any
 pub async fn handle_instance_change(
-    instance: &KubeAkriInstance,
+    instance: &Instance,
     action: &InstanceAction,
     kube_interface: &impl KubeInterface,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-    trace!("handle_instance_change - enter {:?}", action);
+) -> anyhow::Result<()> {
+    trace!("handle_instance_change - enter {action:?}");
+    let instance_name = instance.metadata.name.clone().unwrap();
+    let instance_namespace =
+        instance.metadata.namespace.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Namespace not found for instance: {}", &instance_name)
+        })?;
+    let configuration = match kube_interface
+        .find_configuration(&instance.spec.configuration_name, instance_namespace)
+        .await
+    {
+        Ok(config) => config,
+        _ => {
+            if action != &InstanceAction::Remove {
+                // In this scenario, a configuration has been deleted without the Akri Agent deleting the associated Instances.
+                // Furthermore, Akri Agent is still modifying the Instances. This should not happen because Agent
+                // is designed to shutdown when it's Configuration watcher fails.
+                error!(
+                    "handle_instance_change - no configuration found for {:?} yet instance {:?} exists - check that device plugin is running properly",
+                    &instance.spec.configuration_name, &instance.metadata.name
+                );
+            }
+            return Ok(());
+        }
+    };
+    if let Some(broker_spec) = &configuration.spec.broker_spec {
+        let instance_change_result = match broker_spec {
+            BrokerSpec::BrokerPodSpec(p) => {
+                handle_instance_change_pod(instance, p, action, kube_interface).await
+            }
+            BrokerSpec::BrokerJobSpec(j) => {
+                handle_instance_change_job(
+                    instance,
+                    *configuration.metadata.generation.as_ref().unwrap(),
+                    j,
+                    action,
+                    kube_interface,
+                )
+                .await
+            }
+        };
+        if let Err(e) = instance_change_result {
+            error!("Unable to handle Broker action: {e:?}");
+        }
+    }
+    Ok(())
+}
 
-    let instance_name = instance.metadata.name.clone();
-    let instance_namespace = instance.metadata.namespace.as_ref().ok_or(format!(
-        "Namespace not found for instance: {}",
-        &instance_name
-    ))?;
+/// Called when an Instance has changed that requires a Job broker. Action determined by InstanceAction.
+/// InstanceAction::Add =>  Deploy a Job with JobSpec from Configuration. Label with Instance name.
+/// InstanceAction::Remove => Delete all Jobs labeled with the Instance name
+/// InstanceAction::Update => No nothing
+pub async fn handle_instance_change_job(
+    instance: &Instance,
+    config_generation: i64,
+    job_spec: &JobSpec,
+    action: &InstanceAction,
+    kube_interface: &impl KubeInterface,
+) -> anyhow::Result<()> {
+    trace!("handle_instance_change_job - enter {action:?}");
+    // Create name for Job. Includes Configuration generation in the suffix
+    // to track what version of the Configuration the Job is associated with.
+    let job_name = pod::create_broker_app_name(
+        instance.metadata.name.as_ref().unwrap(),
+        None,
+        instance.spec.shared,
+        &format!("{config_generation}-job"),
+    );
+
+    let instance_name = instance.metadata.name.as_ref().unwrap();
+    let instance_namespace = instance.metadata.namespace.as_ref().unwrap();
     let instance_uid = instance
         .metadata
         .uid
         .as_ref()
-        .ok_or(format!("UID not found for instance: {}", &instance_name))?;
+        .ok_or_else(|| anyhow::anyhow!("UID not found for instance: {}", &instance_name))?;
+    match action {
+        InstanceAction::Add => {
+            trace!("handle_instance_change_job - instance added");
+            let capability_id = format!("{AKRI_PREFIX}/{instance_name}");
+            let new_job = job::create_new_job_from_spec(
+                instance,
+                OwnershipInfo::new(
+                    OwnershipType::Instance,
+                    instance_name.to_string(),
+                    instance_uid.to_string(),
+                ),
+                &capability_id,
+                job_spec,
+                &job_name,
+            )?;
+            kube_interface
+                .create_job(&new_job, instance_namespace)
+                .await?;
+        }
+        InstanceAction::Remove => {
+            trace!("handle_instance_change_job - instance removed");
+            // Find all jobs with the label
+            let instance_jobs = kube_interface
+                .find_jobs_with_label(&format!("{AKRI_INSTANCE_LABEL_NAME}={instance_name}"))
+                .await?;
+            let delete_tasks = instance_jobs.into_iter().map(|j| async move {
+                kube_interface
+                    .remove_job(
+                        j.metadata.name.as_ref().unwrap(),
+                        j.metadata.namespace.as_ref().unwrap(),
+                    )
+                    .await
+            });
+
+            futures::future::try_join_all(delete_tasks).await?;
+        }
+        InstanceAction::Update => {
+            trace!("handle_instance_change_job - instance updated");
+            // TODO: Broker could have encountered unexpected admission error and need to be removed and added
+        }
+    }
+    Ok(())
+}
+
+/// Called when an Instance has changed that requires a Pod broker.
+/// Action determined by InstanceAction and changes to the Instance's `nodes` list.
+/// Starts broker Pods that are missing and stops Pods that are no longer needed.
+/// InstanceAction::Add =>  Deploy Pod to each Node on Instance's `nodes` list (up to `capacity` total)
+/// InstanceAction::Remove => Delete all Pods labeled with the Instance name
+/// InstanceAction::Update => Ensure that each Node on Instance's `nodes` list (up to `capacity` total) have a Pod
+pub async fn handle_instance_change_pod(
+    instance: &Instance,
+    podspec: &PodSpec,
+    action: &InstanceAction,
+    kube_interface: &impl KubeInterface,
+) -> anyhow::Result<()> {
+    trace!("handle_instance_change_pod - enter {action:?}");
+
+    let instance_name = instance.metadata.name.clone().unwrap();
 
     // If InstanceAction::Remove, assume all nodes require PodAction::NoAction (reflect that there is no running Pod unless we find one)
     // Otherwise, assume all nodes require PodAction::Add (reflect that there is no running Pod, unless we find one)
@@ -437,18 +539,13 @@ pub async fn handle_instance_change(
             )
         })
         .collect();
-    trace!(
-        "handle_instance_change - nodes tracked from instance={:?}",
-        nodes_to_act_on
-    );
+    trace!("handle_instance_change - nodes tracked from instance={nodes_to_act_on:?}");
 
     trace!(
-        "handle_instance_change - find all pods that have {}={}",
-        AKRI_INSTANCE_LABEL_NAME,
-        instance_name
+        "handle_instance_change - find all pods that have {AKRI_INSTANCE_LABEL_NAME}={instance_name}"
     );
     let instance_pods = kube_interface
-        .find_pods_with_label(&format!("{}={}", AKRI_INSTANCE_LABEL_NAME, instance_name))
+        .find_pods_with_label(&format!("{AKRI_INSTANCE_LABEL_NAME}={instance_name}"))
         .await?;
     trace!(
         "handle_instance_change - found {} pods",
@@ -462,18 +559,30 @@ pub async fn handle_instance_change(
     instance_pods
         .items
         .iter()
-        .for_each(|x| determine_action_for_pod(x, action, &mut nodes_to_act_on));
-    trace!(
-        "handle_instance_change - nodes tracked after querying existing pods={:?}",
-        nodes_to_act_on
-    );
+        .try_for_each(|x| determine_action_for_pod(x, action, &mut nodes_to_act_on))?;
 
+    trace!(
+        "handle_instance_change - nodes tracked after querying existing pods={nodes_to_act_on:?}"
+    );
+    do_pod_action_for_nodes(nodes_to_act_on, instance, podspec, kube_interface).await?;
+    trace!("handle_instance_change - exit");
+
+    Ok(())
+}
+
+pub(crate) async fn do_pod_action_for_nodes(
+    nodes_to_act_on: HashMap<String, PodContext>,
+    instance: &Instance,
+    podspec: &PodSpec,
+    kube_interface: &impl KubeInterface,
+) -> anyhow::Result<()> {
+    trace!("do_pod_action_for_nodes - enter");
     // Iterate over nodes_to_act_on where value == (PodAction::Remove | PodAction::RemoveAndAdd)
     for (node_to_delete_pod, context) in nodes_to_act_on.iter().filter(|&(_, v)| {
         ((v.action) == PodAction::Remove) | ((v.action) == PodAction::RemoveAndAdd)
     }) {
         handle_deletion_work(
-            &instance_name,
+            instance.metadata.name.as_ref().unwrap(),
             &instance.spec.configuration_name,
             instance.spec.shared,
             node_to_delete_pod,
@@ -495,54 +604,20 @@ pub async fn handle_instance_change(
         })
         .collect::<Vec<String>>();
 
-    let instance_configuration_option = if !nodes_to_add.is_empty() {
-        // Only retrieve Config if needed
-        trace!(
-            "handle_instance_change - find configuration for {:?}",
-            &instance.spec.configuration_name
-        );
-        let instance_configuration = match kube_interface
-            .find_configuration(&instance.spec.configuration_name, &instance_namespace)
-            .await
-        {
-            Ok(config) => config,
-            _ => {
-                // In this scenario, a configuration has been deleted without a Akri Agent deleting the associated Instances.
-                // Furthermore, Akri Agent is still modifying the Instances. This should not happen beacuse Agent
-                // is designed to shutdown when it's Configuration watcher fails.
-                error!(
-                    "handle_instance_change - no configuration found for {} yet instance {} exists - check that device plugin is running propertly",
-                    &instance.spec.configuration_name, &instance.metadata.name
-                );
-                return Ok(());
-            }
-        };
-        trace!(
-            "handle_instance_change - found configuration for {:?}",
-            &instance_configuration.metadata.name
-        );
-        Some(instance_configuration)
-    } else {
-        None
-    };
-
     // Iterate over nodes_to_act_on where value == (PodAction::Add | PodAction::RemoveAndAdd)
     for new_node in nodes_to_add {
         handle_addition_work(
-            &instance_name,
-            &instance_uid,
-            &instance_namespace,
+            instance.metadata.name.as_ref().unwrap(),
+            instance.metadata.uid.as_ref().unwrap(),
+            instance.metadata.namespace.as_ref().unwrap(),
             &instance.spec.configuration_name,
             instance.spec.shared,
             &new_node,
-            &instance_configuration_option.as_ref().unwrap(),
+            podspec,
             kube_interface,
         )
         .await?;
     }
-
-    trace!("handle_instance_change - exit");
-
     Ok(())
 }
 
@@ -552,12 +627,12 @@ mod handle_instance_tests {
     use super::super::shared_test_utils::config_for_tests::PodList;
     use super::*;
     use akri_shared::{
-        akri::instance::KubeAkriInstance,
-        k8s::{pod::AKRI_INSTANCE_LABEL_NAME, MockKubeInterface},
+        akri::instance::Instance,
+        k8s::{MockKubeInterface, pod::AKRI_INSTANCE_LABEL_NAME},
         os::file,
     };
-    use chrono::prelude::*;
     use chrono::Utc;
+    use chrono::prelude::*;
     use mockall::predicate::*;
 
     fn configure_find_pods_with_phase(
@@ -566,10 +641,7 @@ mod handle_instance_tests {
         result_file: &'static str,
         specified_phase: &'static str,
     ) {
-        trace!(
-            "mock.expect_find_pods_with_label pod_selector:{}",
-            pod_selector
-        );
+        trace!("mock.expect_find_pods_with_label pod_selector:{pod_selector}");
         mock.expect_find_pods_with_label()
             .times(1)
             .withf(move |selector| selector == pod_selector)
@@ -577,7 +649,7 @@ mod handle_instance_tests {
                 let pods_json = file::read_file_to_string(result_file);
                 let phase_adjusted_json = pods_json.replace(
                     "\"phase\": \"Running\"",
-                    &format!("\"phase\": \"{}\"", specified_phase),
+                    &format!("\"phase\": \"{specified_phase}\""),
                 );
                 let pods: PodList = serde_json::from_str(&phase_adjusted_json).unwrap();
                 Ok(pods)
@@ -591,10 +663,7 @@ mod handle_instance_tests {
         specified_phase: &'static str,
         start_time: DateTime<Utc>,
     ) {
-        trace!(
-            "mock.expect_find_pods_with_label pod_selector:{}",
-            pod_selector
-        );
+        trace!("mock.expect_find_pods_with_label pod_selector:{pod_selector}");
         mock.expect_find_pods_with_label()
             .times(1)
             .withf(move |selector| selector == pod_selector)
@@ -602,13 +671,13 @@ mod handle_instance_tests {
                 let pods_json = file::read_file_to_string(result_file);
                 let phase_adjusted_json = pods_json.replace(
                     "\"phase\": \"Running\"",
-                    &format!("\"phase\": \"{}\"", specified_phase),
+                    &format!("\"phase\": \"{specified_phase}\""),
                 );
                 let start_time_adjusted_json = phase_adjusted_json.replace(
                     "\"startTime\": \"2020-02-25T20:48:03Z\"",
                     &format!(
                         "\"startTime\": \"{}\"",
-                        start_time.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+                        start_time.format("%Y-%m-%dT%H:%M:%SZ")
                     ),
                 );
                 let pods: PodList = serde_json::from_str(&start_time_adjusted_json).unwrap();
@@ -622,10 +691,7 @@ mod handle_instance_tests {
         result_file: &'static str,
         specified_phase: &'static str,
     ) {
-        trace!(
-            "mock.expect_find_pods_with_label pod_selector:{}",
-            pod_selector
-        );
+        trace!("mock.expect_find_pods_with_label pod_selector:{pod_selector}");
         mock.expect_find_pods_with_label()
             .times(1)
             .withf(move |selector| selector == pod_selector)
@@ -633,7 +699,7 @@ mod handle_instance_tests {
                 let pods_json = file::read_file_to_string(result_file);
                 let phase_adjusted_json = pods_json.replace(
                     "\"phase\": \"Running\"",
-                    &format!("\"phase\": \"{}\"", specified_phase),
+                    &format!("\"phase\": \"{specified_phase}\""),
                 );
                 let start_time_adjusted_json =
                     phase_adjusted_json.replace("\"startTime\": \"2020-02-25T20:48:03Z\",", "");
@@ -649,14 +715,29 @@ mod handle_instance_tests {
         find_pods_phase: Option<&'static str>,
         find_pods_start_time: Option<DateTime<Utc>>,
         find_pods_delete_start_time: bool,
+        config_work: HandleConfigWork,
         deletion_work: Option<HandleDeletionWork>,
         addition_work: Option<HandleAdditionWork>,
+    }
+
+    #[derive(Clone)]
+    struct HandleConfigWork {
+        find_config_name: &'static str,
+        find_config_namespace: &'static str,
+        find_config_result: &'static str,
     }
 
     fn configure_for_handle_instance_change(
         mock: &mut MockKubeInterface,
         work: &HandleInstanceWork,
     ) {
+        config_for_tests::configure_find_config(
+            mock,
+            work.config_work.find_config_name,
+            work.config_work.find_config_namespace,
+            work.config_work.find_config_result,
+            false,
+        );
         if let Some(phase) = work.find_pods_phase {
             if let Some(start_time) = work.find_pods_start_time {
                 configure_find_pods_with_phase_and_start_time(
@@ -695,13 +776,6 @@ mod handle_instance_tests {
         }
 
         if let Some(addition_work) = &work.addition_work {
-            config_for_tests::configure_find_config(
-                mock,
-                addition_work.find_config_name,
-                addition_work.find_config_namespace,
-                addition_work.find_config_result,
-                false,
-            );
             configure_for_handle_addition_work(mock, addition_work);
         }
     }
@@ -740,33 +814,33 @@ mod handle_instance_tests {
 
     #[derive(Clone)]
     struct HandleAdditionWork {
-        find_config_name: &'static str,
-        find_config_namespace: &'static str,
-        find_config_result: &'static str,
         new_pod_names: Vec<&'static str>,
         new_pod_instance_names: Vec<&'static str>,
         new_pod_namespaces: Vec<&'static str>,
+        new_pod_error: Vec<bool>,
     }
 
     fn configure_add_shared_config_a_359973(pod_name: &'static str) -> HandleAdditionWork {
         HandleAdditionWork {
-            find_config_name: "config-a",
-            find_config_namespace: "config-a-namespace",
-            find_config_result: "../test/json/config-a.json",
             new_pod_names: vec![pod_name],
             new_pod_instance_names: vec!["config-a-359973"],
             new_pod_namespaces: vec!["config-a-namespace"],
+            new_pod_error: vec![false],
         }
     }
-
-    fn configure_add_local_config_a_b494b6() -> HandleAdditionWork {
-        HandleAdditionWork {
+    fn get_config_work() -> HandleConfigWork {
+        HandleConfigWork {
             find_config_name: "config-a",
             find_config_namespace: "config-a-namespace",
             find_config_result: "../test/json/config-a.json",
+        }
+    }
+    fn configure_add_local_config_a_b494b6(error: bool) -> HandleAdditionWork {
+        HandleAdditionWork {
             new_pod_names: vec!["config-a-b494b6-pod"],
             new_pod_instance_names: vec!["config-a-b494b6"],
             new_pod_namespaces: vec!["config-a-namespace"],
+            new_pod_error: vec![error],
         }
     }
 
@@ -778,6 +852,7 @@ mod handle_instance_tests {
                 work.new_pod_namespaces[i],
                 AKRI_INSTANCE_LABEL_NAME,
                 work.new_pod_instance_names[i],
+                work.new_pod_error[i],
             );
         }
     }
@@ -789,18 +864,36 @@ mod handle_instance_tests {
     ) {
         trace!("run_handle_instance_change_test enter");
         let instance_json = file::read_file_to_string(instance_file);
-        let instance: KubeAkriInstance = serde_json::from_str(&instance_json).unwrap();
+        let instance: Instance = serde_json::from_str(&instance_json).unwrap();
         handle_instance(
             match action {
-                InstanceAction::Add => WatchEvent::Added(instance),
-                InstanceAction::Update => WatchEvent::Modified(instance),
-                InstanceAction::Remove => WatchEvent::Deleted(instance),
+                InstanceAction::Add | InstanceAction::Update => Event::Apply(instance),
+                InstanceAction::Remove => Event::Delete(instance),
             },
             mock,
+            &mut false,
         )
         .await
         .unwrap();
         trace!("run_handle_instance_change_test exit");
+    }
+
+    // Test that watcher errors on restarts unless it is the first restart (aka initial startup)
+    #[tokio::test]
+    async fn test_handle_watcher_restart() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let mut first_event = true;
+        assert!(
+            handle_instance(Event::Init, &MockKubeInterface::new(), &mut first_event)
+                .await
+                .is_ok()
+        );
+        first_event = false;
+        assert!(
+            handle_instance(Event::Init, &MockKubeInterface::new(), &mut first_event)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -825,8 +918,35 @@ mod handle_instance_tests {
                 find_pods_phase: None,
                 find_pods_start_time: None,
                 find_pods_delete_start_time: false,
+                config_work: get_config_work(),
                 deletion_work: None,
-                addition_work: Some(configure_add_local_config_a_b494b6()),
+                addition_work: Some(configure_add_local_config_a_b494b6(false)),
+            },
+        );
+        run_handle_instance_change_test(
+            &mut mock,
+            "../test/json/local-instance.json",
+            &InstanceAction::Add,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_handle_instance_change_for_add_new_local_instance_error() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let mut mock = MockKubeInterface::new();
+        configure_for_handle_instance_change(
+            &mut mock,
+            &HandleInstanceWork {
+                find_pods_selector: "akri.sh/instance=config-a-b494b6",
+                find_pods_result: "../test/json/empty-list.json",
+                find_pods_phase: None,
+                find_pods_start_time: None,
+                find_pods_delete_start_time: false,
+                config_work: get_config_work(),
+                deletion_work: None,
+                addition_work: Some(configure_add_local_config_a_b494b6(true)),
             },
         );
         run_handle_instance_change_test(
@@ -850,6 +970,7 @@ mod handle_instance_tests {
                 find_pods_phase: None,
                 find_pods_start_time: None,
                 find_pods_delete_start_time: false,
+                config_work: get_config_work(),
                 deletion_work: Some(configure_deletion_work_for_config_a_b494b6()),
                 addition_work: None,
             },
@@ -875,6 +996,7 @@ mod handle_instance_tests {
                 find_pods_phase: None,
                 find_pods_start_time: None,
                 find_pods_delete_start_time: false,
+                config_work: get_config_work(),
                 deletion_work: None,
                 addition_work: Some(configure_add_shared_config_a_359973(
                     "node-a-config-a-359973-pod",
@@ -902,6 +1024,7 @@ mod handle_instance_tests {
                 find_pods_phase: None,
                 find_pods_start_time: None,
                 find_pods_delete_start_time: false,
+                config_work: get_config_work(),
                 deletion_work: Some(configure_deletion_work_for_config_a_359973()),
                 addition_work: None,
             },
@@ -927,6 +1050,7 @@ mod handle_instance_tests {
                 find_pods_phase: None,
                 find_pods_start_time: None,
                 find_pods_delete_start_time: false,
+                config_work: get_config_work(),
                 deletion_work: Some(configure_deletion_work_for_config_a_359973()),
                 addition_work: Some(configure_add_shared_config_a_359973(
                     "node-b-config-a-359973-pod",
@@ -948,7 +1072,7 @@ mod handle_instance_tests {
         let deleted_node = "node-b";
         let instance_file = "../test/json/shared-instance-update.json";
         let instance_json = file::read_file_to_string(instance_file);
-        let kube_object_instance: KubeAkriInstance = serde_json::from_str(&instance_json).unwrap();
+        let kube_object_instance: Instance = serde_json::from_str(&instance_json).unwrap();
         let mut instance = kube_object_instance.spec;
         instance.nodes = instance
             .nodes
@@ -982,13 +1106,14 @@ mod handle_instance_tests {
                 find_pods_phase: None,
                 find_pods_start_time: None,
                 find_pods_delete_start_time: false,
+                config_work: get_config_work(),
                 deletion_work: Some(configure_deletion_work_for_config_a_359973()),
                 addition_work: Some(configure_add_shared_config_a_359973(
                     "node-b-config-a-359973-pod",
                 )),
             },
         );
-        run_handle_instance_change_test(&mut mock, &instance_file, &InstanceAction::Update).await;
+        run_handle_instance_change_test(&mut mock, instance_file, &InstanceAction::Update).await;
     }
 
     /// Checks that the BROKER_POD_COUNT_METRIC is appropriately incremented
@@ -1014,8 +1139,9 @@ mod handle_instance_tests {
                 find_pods_phase: None,
                 find_pods_start_time: None,
                 find_pods_delete_start_time: false,
+                config_work: get_config_work(),
                 deletion_work: None,
-                addition_work: Some(configure_add_local_config_a_b494b6()),
+                addition_work: Some(configure_add_local_config_a_b494b6(false)),
             },
         );
         run_handle_instance_change_test(
@@ -1041,6 +1167,7 @@ mod handle_instance_tests {
                 find_pods_phase: None,
                 find_pods_start_time: None,
                 find_pods_delete_start_time: false,
+                config_work: get_config_work(),
                 deletion_work: Some(configure_deletion_work_for_config_a_b494b6()),
                 addition_work: None,
             },

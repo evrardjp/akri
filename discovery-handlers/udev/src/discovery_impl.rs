@@ -1,13 +1,15 @@
+use std::collections::HashSet;
+
 use super::wrappers::{
     udev_device::{
-        get_attribute_value, get_devnode, get_devpath, get_driver, get_parent, get_property_value,
-        get_subsystem, get_sysname, DeviceExt,
+        DeviceExt, get_attribute_value, get_devnode, get_devpath, get_driver, get_parent,
+        get_property_value, get_subsystem, get_sysname,
     },
     udev_enumerator::Enumerator,
 };
 use log::{error, info, trace};
-use pest::iterators::Pair;
 use pest::Parser;
+use pest::iterators::Pair;
 use regex::Regex;
 
 const TAGS: &str = "TAGS";
@@ -23,18 +25,18 @@ pub struct UdevFilter<'a> {
     value: String,
 }
 
+/// A udev device is defined by its devpath and devnode (if exists)
+pub(crate) type DeviceProperties = (String, Option<String>);
+
 /// This parses the udev rule into UdevFilters and finds all devices that match those filters
 pub fn do_parse_and_find(
     enumerator: impl Enumerator,
     udev_rule_string: &str,
-) -> Result<Vec<String>, anyhow::Error> {
+) -> Result<Vec<DeviceProperties>, anyhow::Error> {
     let udev_filters = parse_udev_rule(udev_rule_string)?;
-    let devpaths = find_devices(enumerator, udev_filters)?;
-    trace!(
-        "do_parse_and_find - returning discovered devices with devpaths: {:?}",
-        devpaths
-    );
-    Ok(devpaths)
+    let devices = find_devices(enumerator, udev_filters)?;
+    trace!("do_parse_and_find - returning discovered devices with devpaths: {devices:?}");
+    Ok(devices)
 }
 
 /// This parses a udev rule and returns a list of UdevFilter objects that specify which devices to search for.
@@ -45,11 +47,8 @@ pub fn do_parse_and_find(
 /// Udev discovery is only interested in match operations ("==",  "!="), so all action ("=" , "+=" , "-=" , ":=") operations
 /// will be ignored.
 /// Udev discovery is only interested in match fields, so all action fields, such as TEST, are ignored
-fn parse_udev_rule(udev_rule_string: &str) -> Result<Vec<UdevFilter>, anyhow::Error> {
-    info!(
-        "parse_udev_rule - enter for udev rule string {}",
-        udev_rule_string
-    );
+fn parse_udev_rule(udev_rule_string: &str) -> Result<Vec<UdevFilter<'_>>, anyhow::Error> {
+    info!("parse_udev_rule - enter for udev rule string {udev_rule_string}");
     let mut udev_filters: Vec<UdevFilter> = Vec::new();
 
     // So long as parse succeeds, subsequent unwraps will not fails, since they are following the
@@ -76,7 +75,7 @@ fn parse_udev_rule(udev_rule_string: &str) -> Result<Vec<UdevFilter>, anyhow::Er
             ));
         }
 
-        let operation = inner_rules
+        let operation_rule = inner_rules
             .next()
             .unwrap()
             .into_inner()
@@ -85,15 +84,19 @@ fn parse_udev_rule(udev_rule_string: &str) -> Result<Vec<UdevFilter>, anyhow::Er
             .as_rule();
         let mut quoted_value = inner_rules.next().unwrap().into_inner();
         let value = quoted_value.next().unwrap().as_str();
-        if operation != Rule::action_operation {
+        if operation_rule != Rule::action_operation {
             udev_filters.push(UdevFilter {
                 field: inner_field,
-                operation,
+                operation: operation_rule,
                 value: value.to_string(),
             });
         } else {
-            return Err(anyhow::format_err!("parse_udev_rule - unsupported action operation for rule with field [{}], operation [{:?}], and value[{}]",
-            inner_field.into_inner().as_str(), operation, value));
+            return Err(anyhow::format_err!(
+                "parse_udev_rule - unsupported action operation for rule with field [{}], operation [{:?}], and value[{}]",
+                inner_field.into_inner().as_str(),
+                operation_rule,
+                value
+            ));
         }
     }
     Ok(udev_filters)
@@ -103,16 +106,16 @@ fn parse_udev_rule(udev_rule_string: &str) -> Result<Vec<UdevFilter>, anyhow::Er
 fn find_devices(
     enumerator: impl Enumerator,
     udev_filters: Vec<UdevFilter>,
-) -> std::io::Result<Vec<String>> {
+) -> std::io::Result<Vec<DeviceProperties>> {
     let mut enumerator = enumerator;
-    trace!("find_devices - enter with udev_filters {:?}", udev_filters);
+    trace!("find_devices - enter with udev_filters {udev_filters:?}");
 
     // Enumerator scans sys devices for its filters. Only certain filters can be applied to it.
     // Divide device fields by type of filter than can be applied to Enumerator, if any
     // (1) Enumerator can filter for field by equality/match
     // (2) Enumerator can filter for field by inequality/nomatch
     // (3) Enumerator cannot filter for field. Must manually filter by looking at each Device the filtered Enumerator returns.
-    let match_fields = vec![
+    let match_fields = [
         Rule::devpath,
         Rule::kernel,
         Rule::tag,
@@ -120,7 +123,7 @@ fn find_devices(
         Rule::attribute,
         Rule::property,
     ];
-    let nomatch_fields = vec![Rule::attribute, Rule::subsystem];
+    let nomatch_fields = [Rule::attribute, Rule::subsystem];
 
     let mut match_udev_filters: Vec<&UdevFilter> = Vec::new();
     let mut nomatch_udev_filters: Vec<&UdevFilter> = Vec::new();
@@ -147,17 +150,27 @@ fn find_devices(
     let devices: Vec<udev::Device> = enumerator.scan_devices()?.collect();
     let final_devices = filter_by_remaining_udev_filters(devices, remaining_udev_filters);
 
-    let device_devpaths: Vec<String> = final_devices
+    let device_devpaths: Vec<DeviceProperties> = final_devices
         .into_iter()
-        .filter_map(|device| {
+        .map(|device| {
             if let Some(devnode) = get_devnode(&device) {
-                Some(devnode.to_str().unwrap().to_string())
+                (
+                    get_devpath(&device).to_str().unwrap().to_string(),
+                    Some(devnode.to_str().unwrap().to_string()),
+                )
             } else {
-                trace!(
-                    "find_devices - ignoring device with devpath {:?} due to having no devnode",
-                    get_devpath(&device)
-                );
-                None
+                let devpath = get_devpath(&device).to_str().unwrap().to_string();
+                let mut current = device.mockable_parent();
+                while let Some(parent) = current {
+                    if let Some(node) = parent.mockable_devnode() {
+                        return (
+                            parent.mockable_devpath().to_str().unwrap().to_string(),
+                            Some(node.to_str().unwrap().to_string()),
+                        );
+                    }
+                    current = parent.mockable_parent();
+                }
+                (devpath, None)
             }
         })
         .collect();
@@ -167,10 +180,7 @@ fn find_devices(
 
 /// This adds equality filters to the Enumerator
 fn filter_by_match_udev_filters(enumerator: &mut impl Enumerator, udev_filters: Vec<&UdevFilter>) {
-    trace!(
-        "enumerator_match_udev_filters - enter with udev_filters {:?}",
-        udev_filters
-    );
+    trace!("enumerator_match_udev_filters - enter with udev_filters {udev_filters:?}");
     for udev_filter in udev_filters {
         match udev_filter.field.as_rule() {
             Rule::devpath => {
@@ -225,10 +235,7 @@ fn filter_by_nomatch_udev_filters(
     enumerator: &mut impl Enumerator,
     udev_filters: Vec<&UdevFilter>,
 ) {
-    trace!(
-        "enumerator_nomatch_udev_filters - enter with udev_filters {:?}",
-        udev_filters
-    );
+    trace!("enumerator_nomatch_udev_filters - enter with udev_filters {udev_filters:?}");
     for udev_filter in udev_filters {
         match udev_filter.field.as_rule() {
             Rule::attribute => {
@@ -262,10 +269,7 @@ fn filter_by_remaining_udev_filters(
     devices: Vec<impl DeviceExt>,
     udev_filters: Vec<&UdevFilter>,
 ) -> Vec<impl DeviceExt> {
-    trace!(
-        "filter_by_remaining_udev_filters - enter with udev_filters {:?}",
-        udev_filters
-    );
+    trace!("filter_by_remaining_udev_filters - enter with udev_filters {udev_filters:?}");
     let mut mutable_devices = devices;
     for udev_filter in udev_filters {
         let value_regex = Regex::new(&udev_filter.value).unwrap();
@@ -273,45 +277,36 @@ fn filter_by_remaining_udev_filters(
         match udev_filter.field.as_rule() {
             Rule::devpath => {
                 // Filter for inequality. Equality already accounted for in filter_by_match_udev_filters
-                mutable_devices = mutable_devices
-                    .into_iter()
-                    .filter(|device| {
-                        let devpath = get_devpath(device).to_str().unwrap();
-                        !is_regex_match(devpath, &value_regex)
-                    })
-                    .collect();
+                mutable_devices.retain(|device| {
+                    let devpath = get_devpath(device).to_str().unwrap();
+                    !is_regex_match(devpath, &value_regex)
+                });
             }
             Rule::kernel => {
                 // Filter for inequality. Equality already accounted for in filter_by_match_udev_filters
-                mutable_devices = mutable_devices
-                    .into_iter()
-                    .filter(|device| {
-                        let sysname = get_sysname(device).to_str().unwrap();
-                        !is_regex_match(sysname, &value_regex)
-                    })
-                    .collect();
+                mutable_devices.retain(|device| {
+                    let sysname = get_sysname(device).to_str().unwrap();
+                    !is_regex_match(sysname, &value_regex)
+                });
             }
             Rule::tag => {
-                mutable_devices = mutable_devices
-                    .into_iter()
-                    .filter(|device| {
-                        if let Some(tags) = get_property_value(device, TAGS) {
-                            let tags = tags.to_str().unwrap().split(':');
-                            // Filter for inequality. Equality already accounted for in filter_by_match_udev_filters
-                            // Return false if discover a tag that should be excluded
-                            let mut include = true;
-                            for tag in tags {
-                                if is_regex_match(tag, &value_regex) {
-                                    include = false;
-                                    break;
-                                }
+                mutable_devices.retain(|device| {
+                    if let Some(tags) = get_property_value(device, TAGS) {
+                        let tags = tags.to_str().unwrap().split(':');
+                        // Filter for inequality. Equality already accounted for in filter_by_match_udev_filters
+                        // Return false if discover a tag that should be excluded
+                        let mut include = true;
+                        for tag in tags {
+                            if is_regex_match(tag, &value_regex) {
+                                include = false;
+                                break;
                             }
-                            include
-                        } else {
-                            true
                         }
-                    })
-                    .collect();
+                        include
+                    } else {
+                        true
+                    }
+                });
             }
             Rule::property => {
                 let key = udev_filter
@@ -325,40 +320,31 @@ fn filter_by_remaining_udev_filters(
                     .unwrap()
                     .as_str();
                 // Filter for inequality. Equality already accounted for in filter_by_match_udev_filters
-                mutable_devices = mutable_devices
-                    .into_iter()
-                    .filter(|device| {
-                        if let Some(property_value) = get_property_value(device, key) {
-                            let property_value_str = property_value.to_str().unwrap();
-                            !is_regex_match(property_value_str, &value_regex)
-                        } else {
-                            true
-                        }
-                    })
-                    .collect();
+                mutable_devices.retain(|device| {
+                    if let Some(property_value) = get_property_value(device, key) {
+                        let property_value_str = property_value.to_str().unwrap();
+                        !is_regex_match(property_value_str, &value_regex)
+                    } else {
+                        true
+                    }
+                });
             }
             Rule::driver => {
-                mutable_devices = mutable_devices
-                    .into_iter()
-                    .filter(|device| match get_driver(device) {
-                        Some(driver) => {
-                            let driver = driver.to_str().unwrap();
-                            filter_equality_check(is_equality, is_regex_match(driver, &value_regex))
-                        }
-                        None => !is_equality,
-                    })
-                    .collect();
+                mutable_devices.retain(|device| match get_driver(device) {
+                    Some(driver) => {
+                        let driver = driver.to_str().unwrap();
+                        filter_equality_check(is_equality, is_regex_match(driver, &value_regex))
+                    }
+                    None => !is_equality,
+                });
             }
             Rule::subsystems => {
-                mutable_devices = mutable_devices
-                    .into_iter()
-                    .filter(|device| {
-                        filter_equality_check(
-                            is_equality,
-                            device_or_parents_have_subsystem(device, &value_regex),
-                        )
-                    })
-                    .collect();
+                mutable_devices.retain(|device| {
+                    filter_equality_check(
+                        is_equality,
+                        device_or_parents_have_subsystem(device, &value_regex),
+                    )
+                });
             }
             Rule::attributes => {
                 let key = udev_filter
@@ -371,48 +357,36 @@ fn filter_by_remaining_udev_filters(
                     .next()
                     .unwrap()
                     .as_str();
-                mutable_devices = mutable_devices
-                    .into_iter()
-                    .filter(|device| {
-                        filter_equality_check(
-                            is_equality,
-                            device_or_parents_have_attribute(device, key, &value_regex),
-                        )
-                    })
-                    .collect();
+                mutable_devices.retain(|device| {
+                    filter_equality_check(
+                        is_equality,
+                        device_or_parents_have_attribute(device, key, &value_regex),
+                    )
+                });
             }
             Rule::drivers => {
-                mutable_devices = mutable_devices
-                    .into_iter()
-                    .filter(|device| {
-                        filter_equality_check(
-                            is_equality,
-                            device_or_parents_have_driver(device, &value_regex),
-                        )
-                    })
-                    .collect();
+                mutable_devices.retain(|device| {
+                    filter_equality_check(
+                        is_equality,
+                        device_or_parents_have_driver(device, &value_regex),
+                    )
+                });
             }
             Rule::kernels => {
-                mutable_devices = mutable_devices
-                    .into_iter()
-                    .filter(|device| {
-                        filter_equality_check(
-                            is_equality,
-                            device_or_parents_have_sysname(device, &value_regex),
-                        )
-                    })
-                    .collect();
+                mutable_devices.retain(|device| {
+                    filter_equality_check(
+                        is_equality,
+                        device_or_parents_have_sysname(device, &value_regex),
+                    )
+                });
             }
             Rule::tags => {
-                mutable_devices = mutable_devices
-                    .into_iter()
-                    .filter(|device| {
-                        filter_equality_check(
-                            is_equality,
-                            device_or_parents_have_tag(device, &value_regex),
-                        )
-                    })
-                    .collect();
+                mutable_devices.retain(|device| {
+                    filter_equality_check(
+                        is_equality,
+                        device_or_parents_have_tag(device, &value_regex),
+                    )
+                });
             }
             _ => {
                 error!("filter_by_remaining_udev_filters - encountered unsupported field");
@@ -545,15 +519,53 @@ fn device_or_parents_have_tag(device: &impl DeviceExt, value_regex: &Regex) -> b
     }
 }
 
+/// Retrieve Parent or Children of a device using their sysfs path.
+fn get_device_relatives<'a>(
+    device_path: &str,
+    possible_relatives: impl Iterator<Item = &'a String>,
+) -> (Option<String>, Vec<String>) {
+    let mut childrens = Vec::new();
+    for relative in possible_relatives {
+        match relative {
+            parent if device_path.starts_with(relative.as_str()) => {
+                return (Some(parent.clone()), vec![]);
+            }
+            child if relative.starts_with(device_path) => childrens.push(child.clone()),
+            _ => (),
+        }
+    }
+    (None, childrens)
+}
+
+pub fn insert_device_with_relatives(
+    devpaths: &mut std::collections::HashMap<String, HashSet<DeviceProperties>>,
+    path: DeviceProperties,
+) {
+    match get_device_relatives(&path.0, devpaths.keys()) {
+        (Some(parent), _) => {
+            let _ = devpaths.get_mut(&parent).unwrap().insert(path);
+        }
+        (None, children) => {
+            let id = path.0.clone();
+            let mut children_devices: HashSet<DeviceProperties> = children
+                .into_iter()
+                .flat_map(|child| devpaths.remove(&child).unwrap().into_iter())
+                .collect();
+            children_devices.insert(path);
+            let _ = devpaths.insert(id, children_devices);
+        }
+    }
+}
+
 #[cfg(test)]
 mod discovery_tests {
-    use super::super::wrappers::udev_enumerator::{create_enumerator, MockEnumerator};
+    use super::super::wrappers::udev_enumerator::{MockEnumerator, create_enumerator};
     use super::*;
     use std::{
         collections::HashMap,
         ffi::OsStr,
         fs::File,
-        io::{prelude::*, BufReader},
+        io::{BufReader, prelude::*},
         path::Path,
     };
     #[derive(Clone)]
@@ -603,6 +615,7 @@ mod discovery_tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_mock_device<'a>(
         devpath: &str,
         devnode: &str,
@@ -1312,5 +1325,133 @@ mod discovery_tests {
             enumerator.scan_devices()
         });
         assert_eq!(do_parse_and_find(mock, rule).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_get_device_relatives() {
+        let device_path = "/devices/pci0/usb0/0-1/0-1.1";
+        let children_paths = vec![
+            "/devices/pci0/usb0/0-1/0-1.1/0-1.1:1.0/video4linux/video0".to_string(),
+            "/devices/pci0/usb0/0-1/0-1.1/0-1.1:1.0/video4linux/video1".to_string(),
+            "/devices/pci0/usb0/0-1/0-1.1/0-1.1:1.1".to_string(),
+        ];
+        let unrelated_paths = [
+            "/devices/pci0/usb0/0-1/0-1.2/0-1.2:1.1".to_string(),
+            "/devices/pci0/usb1/0-1/0-1.2/0-1.2:1.1".to_string(),
+        ];
+        let parent_path = ["/devices/pci0/usb0".to_string()];
+        let empty: Vec<String> = Vec::new();
+
+        // Test with children devices
+        let (parent_0, childrens_0) = get_device_relatives(
+            device_path,
+            unrelated_paths.iter().chain(children_paths.iter()),
+        );
+        assert!(parent_0.is_none());
+        assert_eq!(childrens_0, children_paths);
+
+        // Test with no possible relative devices
+        let (parent_1, childrens_1) = get_device_relatives(device_path, empty.iter());
+        assert!(parent_1.is_none());
+        assert_eq!(childrens_1, empty);
+
+        // Test with no related devices
+        let (parent_2, childrens_2) = get_device_relatives(device_path, unrelated_paths.iter());
+        assert!(parent_2.is_none());
+        assert_eq!(childrens_2, empty);
+
+        // Test with a parent device
+        let (parent_4, childrens_4) =
+            get_device_relatives(device_path, children_paths.iter().chain(parent_path.iter()));
+        assert_eq!(parent_4, Some(parent_path[0].clone()));
+        assert_eq!(childrens_4, empty);
+    }
+
+    #[test]
+    fn test_insert_device_with_relatives() {
+        let mut devpaths: HashMap<String, HashSet<DeviceProperties>> = HashMap::default();
+        let related_devices = [
+            ("/sys/device/parent".to_string(), None),
+            (
+                "/sys/device/parent/child1".to_string(),
+                Some("/dev/dev1".to_string()),
+            ),
+            (
+                "/sys/device/parent/child1/child2".to_string(),
+                Some("/dev/dev2".to_string()),
+            ),
+        ];
+        let unrelated_device = (
+            "/sys/device/other".to_string(),
+            Some("/dev/other".to_string()),
+        );
+
+        // Add first device
+        insert_device_with_relatives(&mut devpaths, related_devices[1].clone());
+        assert_eq!(
+            devpaths,
+            HashMap::from([(
+                related_devices[1].0.clone(),
+                HashSet::from([related_devices[1].clone()])
+            )])
+        );
+
+        // Add its child
+        insert_device_with_relatives(&mut devpaths, related_devices[2].clone());
+        assert_eq!(
+            devpaths,
+            HashMap::from([(
+                related_devices[1].0.clone(),
+                HashSet::from([related_devices[1].clone(), related_devices[2].clone()])
+            )])
+        );
+
+        // Add its parent
+        insert_device_with_relatives(&mut devpaths, related_devices[0].clone());
+        assert_eq!(
+            devpaths,
+            HashMap::from([(
+                related_devices[0].0.clone(),
+                HashSet::from([
+                    related_devices[1].clone(),
+                    related_devices[2].clone(),
+                    related_devices[0].clone()
+                ])
+            )])
+        );
+
+        // Add it again
+        insert_device_with_relatives(&mut devpaths, related_devices[0].clone());
+        assert_eq!(
+            devpaths,
+            HashMap::from([(
+                related_devices[0].0.clone(),
+                HashSet::from([
+                    related_devices[1].clone(),
+                    related_devices[2].clone(),
+                    related_devices[0].clone()
+                ])
+            )])
+        );
+
+        // Add a completely unrelated device
+        insert_device_with_relatives(&mut devpaths, unrelated_device.clone());
+        assert_eq!(
+            devpaths,
+            HashMap::from([
+                (
+                    related_devices[0].0.clone(),
+                    HashSet::from([
+                        related_devices[1].clone(),
+                        related_devices[2].clone(),
+                        related_devices[0].clone()
+                    ])
+                ),
+                (
+                    unrelated_device.0.clone(),
+                    HashSet::from([unrelated_device])
+                ),
+            ])
+        );
     }
 }

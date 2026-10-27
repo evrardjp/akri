@@ -3,26 +3,35 @@ apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: akri-agent-daemonset
+  labels: {{- include "akri.labels" . | nindent 4 }}
+    app.kubernetes.io/name: akri-agent
+    app.kubernetes.io/component: agent
 spec:
   selector:
-    matchLabels:
-      name: akri-agent
+    matchLabels: {{- include "akri.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/name: akri-agent
   template:
     metadata:
-      labels:
-        name: akri-agent
+      labels: {{- include "akri.labels" . | nindent 8 }}
+        app.kubernetes.io/name: akri-agent
+        app.kubernetes.io/component: agent
     spec:
       {{- /* hostNetwork is only needed for embedded ONVIF discovery */}}
       {{- if .Values.agent.full }}
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       {{- end }}
-      {{- if .Values.agent.linuxOnly }}
       nodeSelector:
         "kubernetes.io/os": linux
-      {{- end }}
+        {{- if .Values.agent.nodeSelectors }}
+          {{- toYaml .Values.agent.nodeSelectors | nindent 8 }}
+        {{- end }}
       {{- if .Values.rbac.enabled }}
       serviceAccountName: 'akri-agent-sa'
+      {{- end }}
+      {{- with .Values.agent.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
       {{- end }}
       containers:
       - name: akri-agent
@@ -62,12 +71,6 @@ spec:
           - name: DEBUG_ECHO_INSTANCES_SHARED
             value: {{ .Values.debugEcho.configuration.shared | quote }}
           {{- end }}
-          - name: HOST_CRICTL_PATH
-            value: /host/usr/bin/crictl
-          - name: HOST_RUNTIME_ENDPOINT
-            value: unix:///host/var/run/dockershim.sock
-          - name: HOST_IMAGE_ENDPOINT
-            value: unix:///host/var/run/dockershim.sock
           - name: AGENT_NODE_NAME
             valueFrom:
               fieldRef:
@@ -79,10 +82,8 @@ spec:
             mountPath: /var/lib/akri
           - name: device-plugin
             mountPath: /var/lib/kubelet/device-plugins
-          - name: usr-bin-crictl
-            mountPath: /host/usr/bin/crictl
-          - name: var-run-dockershim
-            mountPath: /host/var/run/dockershim.sock
+          - name: pod-resources
+            mountPath: /var/lib/kubelet/pod-resources
           {{- if .Values.agent.host.udev }}
           - name: devices
             mountPath: /run/udev
@@ -103,12 +104,9 @@ spec:
       - name: device-plugin
         hostPath:
           path: "{{ .Values.agent.host.kubeletDevicePlugins }}"
-      - name: usr-bin-crictl
+      - name: pod-resources
         hostPath:
-          path: "{{ .Values.agent.host.crictl }}"
-      - name: var-run-dockershim
-        hostPath:
-          path: "{{ .Values.agent.host.dockerShimSock }}"
+          path: "{{ .Values.agent.host.kubeletPodResources }}"
       {{- if .Values.agent.host.udev }}
       - name: devices
         hostPath:

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 check_file_version()
 {
@@ -10,7 +10,7 @@ check_file_version()
     
     CORRECT_VERSION=$(cat $FILE | grep "$LINE_PATTERN" | grep "$VERSION_STRING")
     if [ "$CORRECT_VERSION" == "" ]; then
-    echo "    Needs upate: $FILE"
+    echo "    Needs update: $FILE"
     echo "        To ensure all files match version.txt, run: version.sh -u -s"
     return 1
     else
@@ -29,7 +29,7 @@ check_twoline_version()
     
     CORRECT_VERSION=$(grep "$LINE1_PATTERN" -A 1 $FILE | grep "$VERSION_STRING")
     if [ "$CORRECT_VERSION" == "" ]; then
-    echo "    Needs upate: $FILE"
+    echo "    Needs update: $FILE"
     echo "        To ensure all files match version.txt, run: version.sh -u -s"
     return 1
     else
@@ -124,16 +124,12 @@ if [ "$CHECK" == "1" ]; then
     echo "    Verified format: $BASEDIR/version.txt"
     fi
 
-    CARGO_FILES="$BASEDIR/shared/Cargo.toml $BASEDIR/agent/Cargo.toml $BASEDIR/controller/Cargo.toml $BASEDIR/samples/brokers/udev-video-broker/Cargo.toml $BASEDIR/webhooks/validating/configuration/Cargo.toml $BASEDIR/discovery-utils/Cargo.toml $BASEDIR/discovery-handlers/debug-echo/Cargo.toml $BASEDIR/discovery-handlers/onvif/Cargo.toml $BASEDIR/discovery-handlers/opcua/Cargo.toml $BASEDIR/discovery-handlers/udev/Cargo.toml $BASEDIR/discovery-handler-modules/debug-echo-discovery-handler/Cargo.toml $BASEDIR/discovery-handler-modules/onvif-discovery-handler/Cargo.toml $BASEDIR/discovery-handler-modules/opcua-discovery-handler/Cargo.toml $BASEDIR/discovery-handler-modules/udev-discovery-handler/Cargo.toml"
-    TOML_VERSION_PATTERN="^version"
-    TOML_VERSION="\"$(echo $VERSION)\""
-    for CARGO_FILE in $CARGO_FILES
-    do
-        check_file_version "$CARGO_FILE" "$TOML_VERSION_PATTERN" "$TOML_VERSION"
-        if [ "$?" -eq "1" ]; then exit 1; fi
-    done
+    TOML_VERSION_PATTERN="^version = .*"
+    TOML_VERSION_LINE="version = \"$NEW_VERSION\""
+    check_file_version "$BASEDIR/Cargo.toml" "$TOML_VERSION_PATTERN" "$TOML_VERSION"
+    if [ "$?" -eq "1" ]; then exit 1; fi
 
-    CARGO_LOCK_PROJECTS="controller akri-shared agent controller webhook-configuration udev-video-broker akri-discovery-utils akri-debug-echo akri-udev akri-onvif akri-opcua debug-echo-discovery-handler onvif-discovery-handler udev-discovery-handler opcua-discovery-handler"
+    CARGO_LOCK_PROJECTS="controller akri-shared agent controller webhook-configuration akri-discovery-utils akri-debug-echo akri-udev akri-onvif akri-opcua debug-echo-discovery-handler onvif-discovery-handler udev-discovery-handler opcua-discovery-handler"
     CARGO_LOCK_VERSION="\"$(echo $VERSION)\""
     for CARGO_LOCK_PROJECT in $CARGO_LOCK_PROJECTS
     do
@@ -141,15 +137,11 @@ if [ "$CHECK" == "1" ]; then
         if [ "$?" -eq "1" ]; then exit 1; fi
     done
 
-    CRD_VERSION="v$(echo $VERSION | awk -F '.' '{print $1}')"
-    check_file_version "$BASEDIR/samples/brokers/onvif-video-broker/Akri.cs" "private const string VERSION = \"akri.sh/" "$CRD_VERSION"
-    if [ "$?" -eq "1" ]; then exit 1; fi
-
     check_file_version "$BASEDIR/shared/src/akri/mod.rs" "^pub const API_VERSION" "$CRD_VERSION"
     if [ "$?" -eq "1" ]; then exit 1; fi
 
     CRD_FILES="$BASEDIR/deployment/helm/crds/akri-configuration-crd.yaml $BASEDIR/deployment/helm/crds/akri-instance-crd.yaml"
-    CRD_VERSION_PATTERN="^    - name: "
+    CRD_VERSION_PATTERN="^    [- ] name: "
     for CRD_FILE in $CRD_FILES
     do
         check_file_version "$CRD_FILE" "$CRD_VERSION_PATTERN" "$CRD_VERSION"
@@ -187,30 +179,15 @@ then
     fi
     echo "Updating to version: $NEW_VERSION"
 
-    CARGO_FILES="$BASEDIR/shared/Cargo.toml $BASEDIR/agent/Cargo.toml $BASEDIR/controller/Cargo.toml $BASEDIR/samples/brokers/udev-video-broker/Cargo.toml $BASEDIR/webhooks/validating/configuration/Cargo.toml $BASEDIR/discovery-utils/Cargo.toml $BASEDIR/discovery-handlers/debug-echo/Cargo.toml $BASEDIR/discovery-handlers/onvif/Cargo.toml $BASEDIR/discovery-handlers/opcua/Cargo.toml $BASEDIR/discovery-handlers/udev/Cargo.toml $BASEDIR/discovery-handler-modules/debug-echo-discovery-handler/Cargo.toml $BASEDIR/discovery-handler-modules/onvif-discovery-handler/Cargo.toml $BASEDIR/discovery-handler-modules/opcua-discovery-handler/Cargo.toml $BASEDIR/discovery-handler-modules/udev-discovery-handler/Cargo.toml"
     TOML_VERSION_PATTERN="^version = .*"
     TOML_VERSION_LINE="version = \"$NEW_VERSION\""
-    for CARGO_FILE in $CARGO_FILES
-    do
-        update_file_version "$CARGO_FILE" "$TOML_VERSION_PATTERN" "$TOML_VERSION_LINE"
-        if [ "$?" -eq "1" ]; then exit 1; fi
-    done
+    update_file_version "$BASEDIR/Cargo.toml" "$TOML_VERSION_PATTERN" "$TOML_VERSION_LINE"
+    if [ "$?" -eq "1" ]; then exit 1; fi
 
-    CARGO_LOCK_PROJECTS="controller akri-shared agent controller webhook-configuration udev-video-broker akri-discovery-utils akri-debug-echo akri-udev akri-onvif akri-opcua debug-echo-discovery-handler onvif-discovery-handler udev-discovery-handler opcua-discovery-handler"
-    CARGO_LOCK_VERSION_PATTERN="^version = .*"
-    CARGO_LOCK_VERSION_LINE="version = \"$NEW_VERSION\""
-    for CARGO_LOCK_PROJECT in $CARGO_LOCK_PROJECTS
-    do
-        update_twoline_version "$BASEDIR/Cargo.lock" "name = \"$CARGO_LOCK_PROJECT\"" "$CARGO_LOCK_VERSION_PATTERN" "name = \"$CARGO_LOCK_PROJECT\"" "$CARGO_LOCK_VERSION_LINE"
-        if [ "$?" -eq "1" ]; then exit 1; fi
-    done
+    # Update the lockfile
+    cargo update
 
     CRD_VERSION="v$(echo $NEW_VERSION | awk -F '.' '{print $1}')"
-
-    CS_AKRI_VERSION_PATTERN="^private const string VERSION = \"akri.sh\/.*"
-    CS_AKRI_VERSION_LINE="private const string VERSION = \"akri.sh\/$CRD_VERSION\";"
-    update_file_version "$BASEDIR/samples/brokers/onvif-video-broker/Akri.cs" "$CS_AKRI_VERSION_PATTERN" "$CS_AKRI_VERSION_LINE"
-    if [ "$?" -eq "1" ]; then exit 1; fi
 
     RS_AKRI_VERSION_PATTERN="^pub const API_VERSION: &str.*"
     RS_AKRI_VERSION_LINE="pub const API_VERSION: \&str = \"$CRD_VERSION\";"
@@ -242,7 +219,7 @@ then
         if [ "$?" -eq "1" ]; then exit 1; fi
     done
 
-    echo $NEW_VERSION > ./version.txt
+    echo $NEW_VERSION > $BASEDIR/version.txt
     echo "Updated to version: $NEW_VERSION"
 fi
 

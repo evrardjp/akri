@@ -1,3 +1,7 @@
-# https://help.github.com/en/articles/about-code-owners#codeowners-syntax
+# This file is described here: https://help.github.com/en/articles/about-code-owners
 
-*   @bfjelds @kate-goldenring @jiria @britel @romoh
+# Global Owners: These members are Core Maintainers of Akri
+
+- @yujinkim-msft
+- @bindsi
+- @lilustga

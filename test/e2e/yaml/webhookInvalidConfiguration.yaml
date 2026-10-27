@@ -1,0 +1,42 @@
+apiVersion: akri.sh/v0
+kind: Configuration
+metadata:
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: ""
+  creationTimestamp: "2021-01-01T00:00:00Z"
+  generation: 1
+  managedFields: []
+  name: broker
+  uid: "00000000-0000-0000-0000-000000000000"
+spec:
+  capacity: 1
+  discoveryHandler:
+    name: debugEcho
+    discoveryDetails: |
+      descriptions: ["foo", "bar"]
+  brokerSpec:
+    brokerPodSpec:
+      # Unknown field on PodSpec — dropped on typed round-trip, causing the
+      # webhook to detect a mismatch and reject the Configuration.
+      # The original fixture relied on `resources` at the PodSpec level being
+      # schema-invalid; that's no longer true as of k8s 1.32 (PodLevelResources
+      # alpha), so a synthetic unknown field is used instead.
+      xUnknownSyntheticField: this_field_does_not_exist
+      containers:
+        - name: test-broker
+          image: "nginx:stable-alpine"
+          imagePullPolicy: Always
+  instanceServiceSpec:
+    type: ClusterIP
+    ports:
+      - name: name
+        port: 0
+        targetPort: 0
+        protocol: TCP
+  configurationServiceSpec:
+    type: ClusterIP
+    ports:
+      - name: name
+        port: 0
+        targetPort: 0
+        protocol: TCP

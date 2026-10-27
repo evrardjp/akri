@@ -2,7 +2,8 @@
 pub mod v0;
 
 /// Definition of the DiscoverStream type expected for supported embedded Akri DiscoveryHandlers
-pub type DiscoverStream = tokio::sync::mpsc::Receiver<Result<v0::DiscoverResponse, tonic::Status>>;
+pub type DiscoverStream =
+    tokio_stream::wrappers::ReceiverStream<Result<v0::DiscoverResponse, tonic::Status>>;
 
 pub mod discovery_handler {
     use super::super::registration_client::{
@@ -11,8 +12,8 @@ pub mod discovery_handler {
     use super::{
         server::run_discovery_server,
         v0::{
-            discovery_handler_server::DiscoveryHandler,
-            register_discovery_handler_request::EndpointType, RegisterDiscoveryHandlerRequest,
+            RegisterDiscoveryHandlerRequest, discovery_handler_server::DiscoveryHandler,
+            register_discovery_handler_request::EndpointType,
         },
     };
     use log::trace;
@@ -40,7 +41,7 @@ pub mod discovery_handler {
             Ok(pod_ip) => {
                 trace!("run_discovery_handler - registering with Agent with IP endpoint");
                 use_uds = false;
-                format!("{}:{}", pod_ip, DISCOVERY_PORT)
+                format!("{pod_ip}:{DISCOVERY_PORT}")
             }
             Err(_) => {
                 trace!("run_discovery_handler - registering with Agent with uds endpoint");
@@ -85,8 +86,7 @@ pub mod discovery_handler {
     {
         let discovery_handler_config: T = serde_yaml::from_str(discovery_details).map_err(|e| {
             anyhow::format_err!(
-                "Configuration discovery details improperly configured with error {:?}",
-                e
+                "Configuration discovery details improperly configured with error {e:?}"
             )
         })?;
         Ok(discovery_handler_config)
@@ -96,7 +96,7 @@ pub mod discovery_handler {
 #[cfg(any(feature = "mock-discovery-handler", test))]
 pub mod mock_discovery_handler {
     use super::v0::{
-        discovery_handler_server::DiscoveryHandler, Device, DiscoverRequest, DiscoverResponse,
+        Device, DiscoverRequest, DiscoverResponse, discovery_handler_server::DiscoveryHandler,
     };
     use akri_shared::uds::unix_stream;
     use async_trait::async_trait;
@@ -117,7 +117,7 @@ pub mod mock_discovery_handler {
             &self,
             _: tonic::Request<DiscoverRequest>,
         ) -> Result<tonic::Response<Self::DiscoverStream>, tonic::Status> {
-            let (mut discovered_devices_sender, discovered_devices_receiver) =
+            let (discovered_devices_sender, discovered_devices_receiver) =
                 mpsc::channel(super::discovery_handler::DISCOVERED_DEVICES_CHANNEL_CAPACITY);
             let devices = self.devices.clone();
             tokio::spawn(async move {
@@ -132,7 +132,9 @@ pub mod mock_discovery_handler {
                     "mock discovery handler error",
                 ))
             } else {
-                Ok(tonic::Response::new(discovered_devices_receiver))
+                Ok(tonic::Response::new(
+                    tokio_stream::wrappers::ReceiverStream::new(discovered_devices_receiver),
+                ))
             }
         }
     }
@@ -162,6 +164,8 @@ pub mod mock_discovery_handler {
         return_error: bool,
         devices: Vec<Device>,
     ) -> tokio::task::JoinHandle<()> {
+        use anyhow::Context;
+
         let discovery_handler = MockDiscoveryHandler {
             return_error,
             devices,
@@ -181,6 +185,7 @@ pub mod mock_discovery_handler {
         // Try to connect in loop until first thread has served Discovery Handler
         unix_stream::try_connect(discovery_handler_endpoint)
             .await
+            .with_context(|| format!("while trying to connect to {discovery_handler_endpoint}"))
             .unwrap();
         handle
     }
@@ -189,7 +194,7 @@ pub mod mock_discovery_handler {
 pub mod server {
     use super::v0::discovery_handler_server::{DiscoveryHandler, DiscoveryHandlerServer};
     use akri_shared::uds::unix_stream;
-    use futures::stream::TryStreamExt;
+    use futures::TryFutureExt;
     use log::info;
     use std::path::Path;
     use tokio::net::UnixListener;
@@ -221,10 +226,19 @@ pub mod server {
             tokio::fs::create_dir_all(Path::new(discovery_endpoint).parent().unwrap()).await?;
             // Delete socket if it already exists
             std::fs::remove_file(discovery_endpoint).unwrap_or(());
-            let mut uds = UnixListener::bind(discovery_endpoint)?;
+            let incoming = {
+                let uds = UnixListener::bind(discovery_endpoint)?;
+
+                async_stream::stream! {
+                    loop {
+                        let item = uds.accept().map_ok(|(st, _)| unix_stream::UnixStream::new(st)).await;
+                        yield item;
+                    }
+                }
+            };
             Server::builder()
                 .add_service(DiscoveryHandlerServer::new(discovery_handler))
-                .serve_with_incoming(uds.incoming().map_ok(unix_stream::UnixStream))
+                .serve_with_incoming(incoming)
                 .await?;
             std::fs::remove_file(discovery_endpoint).unwrap_or(());
         } else {
@@ -242,18 +256,19 @@ pub mod server {
     pub mod tests {
         use super::super::{
             mock_discovery_handler::{
-                get_mock_discovery_handler_dir_and_endpoint, run_mock_discovery_handler,
-                MockDiscoveryHandler,
+                MockDiscoveryHandler, get_mock_discovery_handler_dir_and_endpoint,
+                run_mock_discovery_handler,
             },
-            v0::{discovery_handler_client::DiscoveryHandlerClient, DiscoverRequest},
+            v0::{DiscoverRequest, discovery_handler_client::DiscoveryHandlerClient},
         };
         use super::*;
+        use std::collections::HashMap;
         use std::convert::TryFrom;
         use tempfile::Builder;
         use tokio::net::UnixStream;
         use tonic::{
-            transport::{Endpoint, Uri},
             Request,
+            transport::{Endpoint, Uri},
         };
 
         #[tokio::test]
@@ -267,10 +282,15 @@ pub mod server {
                 Vec::new(),
             )
             .await;
-            let channel = Endpoint::try_from("dummy://[::]:50051")
+            let channel = Endpoint::try_from("http://[::1]:50051")
                 .unwrap()
                 .connect_with_connector(tower::service_fn(move |_: Uri| {
-                    UnixStream::connect(discovery_handler_socket.clone())
+                    let discovery_handler_socket = discovery_handler_socket.clone();
+                    async move {
+                        UnixStream::connect(discovery_handler_socket)
+                            .await
+                            .map(hyper_util::rt::TokioIo::new)
+                    }
                 }))
                 .await
                 .unwrap();
@@ -278,6 +298,7 @@ pub mod server {
             let mut stream = discovery_handler_client
                 .discover(Request::new(DiscoverRequest {
                     discovery_details: String::new(),
+                    discovery_properties: HashMap::new(),
                 }))
                 .await
                 .unwrap()
@@ -296,16 +317,19 @@ pub mod server {
                 .prefix("discovery-handlers")
                 .tempdir()
                 .unwrap();
-            if let Err(e) = internal_run_discovery_server(
+            match internal_run_discovery_server(
                 discovery_handler,
                 "random",
                 discovery_handler_temp_dir.path().to_str().unwrap(),
             )
             .await
             {
-                assert!((*e).to_string().contains("invalid IP address syntax"))
-            } else {
-                panic!("should be invalid IP address error")
+                Err(e) => {
+                    assert!((*e).to_string().contains("invalid socket address syntax"))
+                }
+                _ => {
+                    panic!("should be invalid address error")
+                }
             }
         }
     }

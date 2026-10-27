@@ -1,6 +1,7 @@
 fn main() {
     tonic_build::configure()
         .out_dir("./src/discovery")
-        .compile(&["proto/discovery.proto"], &["proto"])
+        .protoc_arg("--experimental_allow_proto3_optional")
+        .compile_protos(&["proto/discovery.proto"], &["proto"])
         .expect("failed to compile protos");
 }
